@@ -115,7 +115,13 @@ async function authAny(request, env) {
       body: JSON.stringify({ email: id, password: pw, returnSecureToken: true })
     });
     const j = await r.json();
-    if (!r.ok || !j.localId) throw err(401, "login failed");
+    if (!r.ok || !j.localId) {
+      const code = j.error?.message || "";
+      const why = { OPERATION_NOT_ALLOWED: "Enable Email/Password sign-in in Firebase Authentication", EMAIL_NOT_FOUND: "No such admin user in Firebase Auth",
+        INVALID_PASSWORD: "Wrong password", INVALID_LOGIN_CREDENTIALS: "Wrong email or password", USER_DISABLED: "Admin user disabled",
+        API_KEY_INVALID: "FB_API_KEY is wrong", TOO_MANY_ATTEMPTS_TRY_LATER: "Too many attempts, wait a few minutes" }[code.split(" ")[0]];
+      throw err(401, why || ("Admin login failed: " + code));
+    }
     if (env.ADMIN_EMAILS && !env.ADMIN_EMAILS.toLowerCase().split(",").map(s => s.trim()).includes(id.toLowerCase())) throw err(403, "not an admin");
     const token = await jwtSign(env, { role: "admin", email: id, name: j.displayName || id.split("@")[0] }, 12 * 3600);
     return json({ ok: true, role: "admin", token, name: j.displayName || id.split("@")[0] });
