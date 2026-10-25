@@ -13,7 +13,7 @@ VAULT_LINK_TTL = "300"
 # Public URL of this worker (used inside QR codes). Set after first deploy.
 BASE_URL = "https://tenant-dd.ertahirhussainofficial.workers.dev"
 # App update check (shown inside the app when APP_VERSION is higher than the installed one)
-APP_VERSION = "2"
+APP_VERSION = "3"
 APK_URL = ""
 APP_NOTES = ""
 

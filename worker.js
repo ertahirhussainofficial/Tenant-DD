@@ -768,10 +768,16 @@ function fbUrl(env, path, q) {
   for (const k in q || {}) u.searchParams.set(k, q[k]);
   return u.toString();
 }
-async function fbGet(env, path, q) { const r = await fetch(fbUrl(env, path, q)); return r.json(); }
-async function fbPut(env, path, body) { const r = await fetch(fbUrl(env, path), { method: "PUT", body: JSON.stringify(body) }); if (!r.ok) throw err(500, "db write failed"); }
-async function fbPatch(env, path, body) { const r = await fetch(fbUrl(env, path), { method: "PATCH", body: JSON.stringify(body) }); if (!r.ok) throw err(500, "db write failed"); }
-async function fbDelete(env, path) { const r = await fetch(fbUrl(env, path), { method: "DELETE" }); if (!r.ok) throw err(500, "db delete failed"); }
+async function fbGet(env, path, q) { const r = await fetch(fbUrl(env, path, q)); const j = await r.json(); if (!r.ok) throw fbErr(r, j); return j; }
+async function fbPut(env, path, body) { const r = await fetch(fbUrl(env, path), { method: "PUT", body: JSON.stringify(body) }); if (!r.ok) throw fbErr(r, await r.json().catch(() => ({}))); }
+async function fbPatch(env, path, body) { const r = await fetch(fbUrl(env, path), { method: "PATCH", body: JSON.stringify(body) }); if (!r.ok) throw fbErr(r, await r.json().catch(() => ({}))); }
+function fbErr(r, j) {
+  const m = String((j && j.error) || r.status);
+  if (/index/i.test(m)) return err(500, "Firebase index missing — paste firebase.rules.json into Firebase → Realtime Database → Rules → Publish");
+  if (/permission/i.test(m) || r.status === 401) return err(500, "Firebase rejected the database secret — check FB_SECRET and FB_DB_URL");
+  return err(500, "Firebase: " + m);
+}
+async function fbDelete(env, path) { const r = await fetch(fbUrl(env, path), { method: "DELETE" }); if (!r.ok) throw fbErr(r, await r.json().catch(() => ({}))); }
 async function fbQuery(env, path, key, val) { return (await fbGet(env, path, { orderBy: JSON.stringify(key), equalTo: JSON.stringify(val) })) || {}; }
 
 /* ============================ CRYPTO ============================ */
