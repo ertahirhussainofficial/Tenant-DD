@@ -21,7 +21,8 @@ export default {
 async function route(request, env, ctx) {
   const url = new URL(request.url);
   const p = url.pathname.replace(/\/+$/, "") || "/";
-  const m = request.method;
+  // Android HttpURLConnection cannot send PATCH/DELETE bodies → app sends POST + override header
+  const m = (request.method === "POST" && request.headers.get("X-HTTP-Method-Override")) || request.method;
 
   if (m === "OPTIONS") return cors(new Response(null, { status: 204 }));
 
@@ -56,7 +57,17 @@ async function route(request, env, ctx) {
     if ((x = match(p, "/landlord/property/:pid")) && m === "PATCH") return patchProperty(request, env, u, x.pid);
     if (p === "/landlord/properties" && m === "GET") return json({ ok: true, properties: await fbQuery(env, "properties", "lid", u.lid) });
     if (p === "/landlord/tenant" && m === "POST") return createTenant(request, env, u);
-    if ((x = match(p, "/landlord/tenant/:tid")) && m === "GET") return json({ ok: true, tenant: await ownTenant(env, u, x.tid) });
+    if ((x = match(p, "/landlord/tenant/:tid")) && m === "GET") {
+      const T = await ownTenant(env, u, x.tid);
+      const token = await cardToken(env, x.tid, T.tokenVer || 1);
+      const L = await fbGet(env, "landlords/" + u.lid);
+      const P = await fbGet(env, "properties/" + T.pid);
+      return json({ ok: true, tenant: { ...T, effStatus: effStatus(T) }, token, qrUrl: env.BASE_URL + "/v/" + token,
+        property: P || {}, landlord: { name: L.name, phone: L.phone, hasSignature: !!L.signature, hasSeal: !!L.seal },
+        photoUrl: T.photo ? env.BASE_URL + "/photo/" + token : null,
+        sigUrl: L.signature ? env.BASE_URL + "/sig/" + token : null,
+        sealUrl: L.seal ? env.BASE_URL + "/seal/" + token : null });
+    }
     if ((x = match(p, "/landlord/tenant/:tid")) && m === "PATCH") return patchTenant(request, env, u, x.tid);
     if ((x = match(p, "/landlord/tenant/:tid/photo")) && m === "POST") return uploadPhoto(request, env, u, x.tid);
     if ((x = match(p, "/landlord/tenant/:tid/vault")) && m === "POST") return uploadVault(request, env, u, x.tid);
@@ -315,7 +326,14 @@ async function patchViewer(request, env, u, vid) {
 /* ============================ VIEWER ============================ */
 
 async function viewerScan(request, env, u) {
-  const { token, lat, lng } = await request.json();
+  let { token, cardNo, lat, lng } = await request.json();
+  if (!token && cardNo) {                       // manual entry when QR is damaged
+    const c = await fbGet(env, "cards/" + String(cardNo).trim().toUpperCase());
+    if (!c) return json({ ok: true, result: "invalid", reason: "UNKNOWN_CARD" });
+    const T0 = await fbGet(env, "tenants/" + c.tid);
+    token = await cardToken(env, c.tid, T0.tokenVer || 1);
+  }
+  if (token && token.startsWith("http")) token = token.split("/v/")[1] || token;   // full QR URL pasted
   const r = await resolveToken(env, token);
   const scanId = await logScan(env, request, r, { by: u.vid, byName: u.name, dept: u.dept, lat, lng });
   if (!r.ok) return json({ ok: true, result: r.result, reason: r.reason, scanId });
@@ -596,7 +614,7 @@ function match(path, pattern) {
 function cors(res) {
   res.headers.set("Access-Control-Allow-Origin", "*");
   res.headers.set("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS");
-  res.headers.set("Access-Control-Allow-Headers", "Content-Type,Authorization,X-Admin-Key");
+  res.headers.set("Access-Control-Allow-Headers", "Content-Type,Authorization,X-Admin-Key,X-HTTP-Method-Override");
   return res;
 }
 function json(obj, status = 200) { return cors(new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json; charset=utf-8" } })); }
