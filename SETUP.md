@@ -98,3 +98,12 @@ curl -s -X POST $BASE/landlord/viewer -H "Authorization: Bearer $TOK" -H "Conten
 | POST | /admin/landlord | X-Admin-Key | {name,phone,pin} |
 
 QR content = `BASE_URL/v/<token>`. Token = base64url(tid.version) + "." + HMAC. Reissue/lost bumps version → old QR shows NOT VALID.
+
+
+## 7. v2 update (app v2.0) — what changed on the backend
+- Re-paste `firebase.rules.json` into Firebase → Rules (new indexes for `feed`, `adminFeed`, `viewerScans`, `badScans`).
+- `wrangler.toml` has new vars: `APP_VERSION` (bump when you ship a new APK), `APK_URL` (download link shown in-app), `APP_NOTES`.
+- New endpoints used by the app: `/auth/login` (one login for all roles), `/landlord/dashboard`, `/landlord/rooms`, `/landlord/feed`, `/landlord/me` (PATCH: name, helpline, tgChatId, alerts), `/landlord/pin`, `/landlord/tg-test`, `/landlord/export.csv`, `DELETE /landlord/property/:pid`, `DELETE /landlord/viewer/:vid`, `/admin/overview`, `/admin/feed`, `POST /admin/landlord/:lid/token` (open workspace as admin), `/app/version`.
+- Brute-force lock: 5 wrong passwords → 10 min block per login ID.
+- Telegram alerts to the landlord: landlord saves their Telegram ID in the app (More → Telegram alerts). They must press Start on your bot first.
+- Officials scanning another landlord's card get basic details only (no vault / notes / history).

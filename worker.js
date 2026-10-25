@@ -5,8 +5,11 @@
  * Roles:  admin (you, ADMIN_KEY) → landlord (phone+PIN) → viewer (loginId+PIN, created by landlord)
  */
 
+let CTX = null;   // current request context (for fire-and-forget alerts)
+
 export default {
   async fetch(request, env, ctx) {
+    CTX = ctx;
     try {
       return await route(request, env, ctx);
     } catch (e) {
@@ -36,6 +39,7 @@ async function route(request, env, ctx) {
   if ((x = match(p, "/seal/:token")) && m === "GET") return publicStamp(env, x.token, "seal");
   if ((x = match(p, "/vault/:tid/:idx")) && m === "GET") return vaultFile(env, x.tid, x.idx, url);
   if ((x = match(p, "/c/:cardNo")) && m === "GET") return cardLookup(env, x.cardNo);
+  if (p === "/app/version" && m === "GET") return json({ ok: true, version: Number(env.APP_VERSION || 1), apkUrl: env.APK_URL || "", notes: env.APP_NOTES || "" });
 
   // ---------- Auth ----------
   if (p === "/auth/login" && m === "POST") return authAny(request, env);        // one login for all roles
@@ -51,12 +55,33 @@ async function route(request, env, ctx) {
     if (p === "/admin/overview" && m === "GET") return adminOverview(env);
     if ((x = match(p, "/admin/landlord/:lid/tenants")) && m === "GET") return json({ ok: true, tenants: withStatus(await fbQuery(env, "tenants", "lid", x.lid)) });
     if ((x = match(p, "/admin/landlord/:lid/viewers")) && m === "GET") return json({ ok: true, viewers: strip(await fbQuery(env, "viewers", "lid", x.lid)) });
+    if ((x = match(p, "/admin/landlord/:lid/token")) && m === "POST") {          // open a landlord's workspace as admin
+      const L = await fbGet(env, "landlords/" + x.lid); if (!L) throw err(404, "landlord not found");
+      const token = await jwtSign(env, { role: "landlord", lid: x.lid, name: L.name, actingAdmin: true }, 4 * 3600);
+      return json({ ok: true, token, lid: x.lid, name: L.name });
+    }
+    if (p === "/admin/feed" && m === "GET") return json({ ok: true, feed: await fbGet(env, "adminFeed", { orderBy: '"at"', limitToLast: 50 }) || {} });
   }
 
   // ---------- Landlord ----------
   if (p.startsWith("/landlord/")) {
     const u = await auth(request, env, "landlord");
-    if (p === "/landlord/me" && m === "GET") return json({ ok: true, me: await fbGet(env, "landlords/" + u.lid) });
+    if (p === "/landlord/me" && m === "GET") return json({ ok: true, me: strip1(await fbGet(env, "landlords/" + u.lid)), actingAdmin: !!u.actingAdmin });
+    if (p === "/landlord/me" && m === "PATCH") return patchMe(request, env, u);
+    if (p === "/landlord/pin" && m === "POST") return changePin(request, env, u);
+    if (p === "/landlord/tg-test" && m === "POST") {
+      const L = await fbGet(env, "landlords/" + u.lid);
+      if (!L.tgChatId) throw err(400, "Save your Telegram ID first");
+      const r = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ chat_id: L.tgChatId, text: `✅ ${env.APP_NAME || "Tenant Card"}: alerts are linked for ${L.name}. You will receive a message on every scan and official note.` }) });
+      const j = await r.json(); if (!j.ok) throw err(400, "Telegram says: " + (j.description || "failed") + ". Did you press Start on the bot?");
+      return json({ ok: true });
+    }
+    if (p === "/landlord/dashboard" && m === "GET") return dashboard(env, u);
+    if (p === "/landlord/rooms" && m === "GET") return rooms(env, u);
+    if (p === "/landlord/feed" && m === "GET") return json({ ok: true, feed: await fbGet(env, "feed/" + u.lid, { orderBy: '"at"', limitToLast: 100 }) || {} });
+    if (p === "/landlord/export.csv" && m === "GET") return exportCsv(env, u, url.searchParams.get("tid"));
+    if ((x = match(p, "/landlord/property/:pid")) && m === "DELETE") return deleteProperty(env, u, x.pid);
+    if ((x = match(p, "/landlord/viewer/:vid")) && m === "DELETE") return deleteViewer(env, u, x.vid);
     if (p === "/landlord/property" && m === "POST") return createProperty(request, env, u);
     if ((x = match(p, "/landlord/property/:pid")) && m === "PATCH") return patchProperty(request, env, u, x.pid);
     if (p === "/landlord/properties" && m === "GET") return json({ ok: true, properties: await fbQuery(env, "properties", "lid", u.lid) });
@@ -67,7 +92,7 @@ async function route(request, env, ctx) {
       const L = await fbGet(env, "landlords/" + u.lid);
       const P = await fbGet(env, "properties/" + T.pid);
       return json({ ok: true, tenant: { ...T, effStatus: effStatus(T) }, token, qrUrl: env.BASE_URL + "/v/" + token,
-        property: P || {}, landlord: { name: L.name, phone: L.phone, hasSignature: !!L.signature, hasSeal: !!L.seal },
+        property: P || {}, landlord: { name: L.name, phone: L.phone, helpline: L.helpline || "", hasSignature: !!L.signature, hasSeal: !!L.seal },
         photoUrl: T.photo ? env.BASE_URL + "/photo/" + token : null,
         sigUrl: L.signature ? env.BASE_URL + "/sig/" + token : null,
         sealUrl: L.seal ? env.BASE_URL + "/seal/" + token : null });
@@ -77,7 +102,7 @@ async function route(request, env, ctx) {
     if ((x = match(p, "/landlord/tenant/:tid/vault")) && m === "POST") return uploadVault(request, env, u, x.tid);
     if ((x = match(p, "/landlord/tenant/:tid/vault/:idx")) && m === "DELETE") return deleteVault(env, u, x.tid, x.idx);
     if ((x = match(p, "/landlord/tenant/:tid/vault")) && m === "GET") return listVault(env, u, x.tid);
-    if (p === "/landlord/tenants" && m === "GET") return json({ ok: true, tenants: withStatus(await fbQuery(env, "tenants", "lid", u.lid)) });
+    if (p === "/landlord/tenants" && m === "GET") return json({ ok: true, tenants: await withLinks(env, withStatus(await fbQuery(env, "tenants", "lid", u.lid))) });
     if ((x = match(p, "/landlord/logs/:tid")) && m === "GET") return tenantLogs(env, u, x.tid);
     if (p === "/landlord/viewer" && m === "POST") return createViewer(request, env, u);
     if ((x = match(p, "/landlord/viewer/:vid")) && m === "PATCH") return patchViewer(request, env, u, x.vid);
@@ -93,7 +118,7 @@ async function route(request, env, ctx) {
     if (p === "/viewer/me" && m === "GET") return json({ ok: true, me: strip1(await fbGet(env, "viewers/" + u.vid)) });
     if (p === "/viewer/scan" && m === "POST") return viewerScan(request, env, u);
     if (p === "/viewer/note" && m === "POST") return viewerNote(request, env, u);
-    if (p === "/viewer/myscans" && m === "GET") return json({ ok: true, scans: await fbGet(env, "viewerScans/" + u.vid) });
+    if (p === "/viewer/myscans" && m === "GET") return json({ ok: true, scans: await fbGet(env, "viewerScans/" + u.vid, { orderBy: '"at"', limitToLast: 100 }) });
   }
 
   throw err(404, "not found");
@@ -107,6 +132,20 @@ async function authAny(request, env) {
   const id = String(b.id || b.loginId || b.phone || b.email || "").trim();
   const pw = String(b.password || b.pin || "").trim();
   if (!id || !pw) throw err(400, "id and password required");
+  const fkey = "fails/" + id.toLowerCase().replace(/[^a-z0-9]/g, "_").slice(0, 60);
+  const f = (await fbGet(env, fkey)) || { n: 0, at: 0 };
+  if (f.n >= 5 && Date.now() - f.at < 10 * 60000) throw err(429, "Too many attempts. Try again in " + Math.ceil((10 * 60000 - (Date.now() - f.at)) / 60000) + " min");
+  try {
+    const res = await authAnyInner(env, id, pw);
+    if (f.n) await fbDelete(env, fkey);
+    return res;
+  } catch (e) {
+    if (e.status === 401) await fbPut(env, fkey, { n: (Date.now() - f.at < 10 * 60000 ? f.n : 0) + 1, at: Date.now() });
+    throw e;
+  }
+}
+
+async function authAnyInner(env, id, pw) {
 
   if (id.includes("@")) {
     if (!env.FB_API_KEY) throw err(500, "FB_API_KEY not set");
@@ -130,17 +169,19 @@ async function authAny(request, env) {
   if (/^\+?\d{8,15}$/.test(id)) {
     const rows = await fbQuery(env, "landlords", "phone", id.replace(/^\+91/, ""));
     const [lid, L] = Object.entries(rows)[0] || [];
-    if (L && L.status === "active" && await verifyPin(pw, L.pinHash, L.pinSalt)) {
-      const token = await jwtSign(env, { role: "landlord", lid, name: L.name }, 12 * 3600);
-      return json({ ok: true, role: "landlord", token, lid, name: L.name });
-    }
+    if (!L) throw err(401, "No landlord with this phone number");
+    if (L.status !== "active") throw err(401, "Landlord account disabled");
+    if (!(await verifyPin(pw, L.pinHash, L.pinSalt))) throw err(401, "Wrong password");
+    const token = await jwtSign(env, { role: "landlord", lid, name: L.name }, 12 * 3600);
+    return json({ ok: true, role: "landlord", token, lid, name: L.name });
   }
 
   const rows = await fbQuery(env, "viewers", "loginId", id.toLowerCase());
   const [vid, V] = Object.entries(rows)[0] || [];
-  if (!V || V.status !== "active") throw err(401, "login failed");
-  if (V.expiresAt && Date.now() > V.expiresAt) throw err(401, "access expired — contact landlord");
-  if (!(await verifyPin(pw, V.pinHash, V.pinSalt))) throw err(401, "login failed");
+  if (!V) throw err(401, "No official login with this ID");
+  if (V.status !== "active") throw err(401, "Login disabled by landlord");
+  if (V.expiresAt && Date.now() > V.expiresAt) throw err(401, "Access expired — contact landlord");
+  if (!(await verifyPin(pw, V.pinHash, V.pinSalt))) throw err(401, "Wrong password");
   const token = await jwtSign(env, { role: "viewer", vid, lid: V.lid, name: V.name, dept: V.dept, perms: V.perms || {} }, 8 * 3600);
   return json({ ok: true, role: "viewer", token, vid, name: V.name, dept: V.dept, perms: V.perms || {} });
 }
@@ -253,9 +294,10 @@ async function createTenant(request, env, u) {
     idDocType: b.idDocType || "", idDocLast4: (b.idDocLast4 || "").slice(-4),
     cardNo, tokenVer: 1, status: b.activate === false ? "pending" : "active",
     issuedAt: now, validTill: now + days * 86400000,
-    photo: null, vault: [], createdAt: now
+    photo: null, vault: [], createdAt: now, createdBy: u.actingAdmin ? "admin" : "landlord"
   };
   await fbPut(env, "tenants/" + tid, T);
+  await fbPut(env, "feed/" + u.lid + "/" + id("F"), { type: "card", at: now, tid, cardNo, name: T.name, roomNo: T.roomNo, action: "created" });
   await fbPut(env, "cards/" + cardNo, { tid });
   const token = await cardToken(env, tid, 1);
   return json({ ok: true, tid, cardNo, token, qrUrl: env.BASE_URL + "/v/" + token, tenant: T });
@@ -285,6 +327,7 @@ async function patchTenant(request, env, u, tid) {
     default: throw err(400, "unknown action");
   }
   await fbPatch(env, "tenants/" + tid, patch);
+  if (b.action !== "update") await fbPut(env, "feed/" + u.lid + "/" + id("F"), { type: "card", at: now, tid, cardNo: T.cardNo, name: T.name, roomNo: T.roomNo, action: b.action });
   const ver = patch.tokenVer || T.tokenVer || 1;
   const token = await cardToken(env, tid, ver);
   return json({ ok: true, token, qrUrl: env.BASE_URL + "/v/" + token });
@@ -381,6 +424,110 @@ async function patchViewer(request, env, u, vid) {
   return json({ ok: true });
 }
 
+async function patchMe(request, env, u) {
+  const b = await request.json();
+  const patch = {};
+  if (b.name) patch.name = String(b.name);
+  if (b.tgChatId !== undefined) patch.tgChatId = String(b.tgChatId || "");
+  if (b.alerts) patch.alerts = { scan: !!b.alerts.scan, note: !!b.alerts.note };
+  if (b.helpline !== undefined) patch.helpline = String(b.helpline || "");
+  await fbPatch(env, "landlords/" + u.lid, patch);
+  return json({ ok: true });
+}
+
+async function changePin(request, env, u) {
+  const { oldPin, newPin } = await request.json();
+  const L = await fbGet(env, "landlords/" + u.lid);
+  if (!u.actingAdmin && !(await verifyPin(oldPin || "", L.pinHash, L.pinSalt))) throw err(401, "Current password is wrong");
+  if (!newPin || String(newPin).length < 4) throw err(400, "New password must be at least 4 characters");
+  const { hash, salt } = await hashPin(newPin);
+  await fbPatch(env, "landlords/" + u.lid, { pinHash: hash, pinSalt: salt });
+  return json({ ok: true });
+}
+
+async function deleteProperty(env, u, pid) {
+  const P = await fbGet(env, "properties/" + pid);
+  if (!P || P.lid !== u.lid) throw err(404, "property not found");
+  const ts = await fbQuery(env, "tenants", "pid", pid);
+  if (Object.keys(ts).length) throw err(409, "Property has tenants — remove their cards first");
+  await fbDelete(env, "properties/" + pid);
+  return json({ ok: true });
+}
+
+async function deleteViewer(env, u, vid) {
+  const V = await fbGet(env, "viewers/" + vid);
+  if (!V || V.lid !== u.lid) throw err(404, "viewer not found");
+  await fbDelete(env, "viewers/" + vid);
+  return json({ ok: true });
+}
+
+async function withLinks(env, rows) {
+  for (const tid in rows) {
+    const T = rows[tid];
+    const token = await cardToken(env, tid, T.tokenVer || 1);
+    T.token = token; T.qrUrl = env.BASE_URL + "/v/" + token; T.photoUrl = T.photo ? env.BASE_URL + "/photo/" + token : null;
+  }
+  return rows;
+}
+
+/** Rooms with occupancy for every property of this landlord. */
+async function roomsData(env, u) {
+  const [props, tenants] = await Promise.all([fbQuery(env, "properties", "lid", u.lid), fbQuery(env, "tenants", "lid", u.lid)]);
+  const out = [];
+  for (const pid in props) {
+    const P = props[pid];
+    const rooms = {};
+    for (const no of Object.keys(P.rooms || {})) rooms[no] = { no, tenants: [], lastVacatedAt: 0 };
+    for (const tid in tenants) {
+      const T = tenants[tid]; if (T.pid !== pid) continue;
+      const no = String(T.roomNo); if (!rooms[no]) rooms[no] = { no, tenants: [], lastVacatedAt: 0, unlisted: true };
+      const st = effStatus(T);
+      if (st === "active" || st === "pending" || st === "expired") rooms[no].tenants.push({ tid, name: T.name, status: st, cardNo: T.cardNo, validTill: T.validTill });
+      else if (st === "revoked") rooms[no].lastVacatedAt = Math.max(rooms[no].lastVacatedAt, T.revokedAt || 0);
+    }
+    const list = Object.values(rooms).sort((a, b) => a.no.localeCompare(b.no, undefined, { numeric: true }));
+    out.push({ pid, label: P.label || "", address: P.address, policeStation: P.policeStation || "", rooms: list,
+      occupied: list.filter(r => r.tenants.length).length, total: list.length });
+  }
+  return out;
+}
+async function rooms(env, u) { return json({ ok: true, properties: await roomsData(env, u) }); }
+
+async function dashboard(env, u) {
+  const [L, tenants, props, feed] = await Promise.all([
+    fbGet(env, "landlords/" + u.lid), fbQuery(env, "tenants", "lid", u.lid), roomsData(env, u),
+    fbGet(env, "feed/" + u.lid, { orderBy: '"at"', limitToLast: 40 })
+  ]);
+  const now = Date.now(), day = 86400000;
+  const c = { tenants: 0, active: 0, pending: 0, expired: 0, revoked: 0, expiringSoon: [] , noPhoto: 0 };
+  for (const tid in tenants) {
+    const T = tenants[tid]; c.tenants++; const st = effStatus(T); c[st] = (c[st] || 0) + 1;
+    if (st === "active" && T.validTill - now < 30 * day) c.expiringSoon.push({ tid, name: T.name, roomNo: T.roomNo, validTill: T.validTill, cardNo: T.cardNo });
+    if (st === "active" && !T.photo) c.noPhoto++;
+  }
+  let scans24 = 0, notes7 = 0, invalid24 = 0;
+  const items = Object.values(feed || {}).sort((a, b) => b.at - a.at);
+  for (const f of items) { if (f.type === "scan" && now - f.at < day) { scans24++; if (f.result !== "valid") invalid24++; } if (f.type === "note" && now - f.at < 7 * day) notes7++; }
+  const roomsTotal = props.reduce((n, p) => n + p.total, 0), roomsOcc = props.reduce((n, p) => n + p.occupied, 0);
+  return json({ ok: true, name: L.name, actingAdmin: !!u.actingAdmin, counts: c, scans24, invalid24, notes7, roomsTotal, roomsOcc, properties: props.length,
+    hasSignature: !!L.signature, hasSeal: !!L.seal, tgLinked: !!L.tgChatId, recent: items.slice(0, 15) });
+}
+
+async function exportCsv(env, u, tid) {
+  const tenants = tid ? { [tid]: await ownTenant(env, u, tid) } : await fbQuery(env, "tenants", "lid", u.lid);
+  const rows = [["type", "card_no", "tenant", "room", "time", "result_or_tag", "by", "department", "city", "text_or_scan_id"]];
+  const q = v => '"' + String(v == null ? "" : v).replace(/"/g, '""') + '"';
+  for (const id0 in tenants) {
+    const T = tenants[id0];
+    const [scans, notes] = await Promise.all([fbGet(env, "scans/" + id0), fbGet(env, "notes/" + id0)]);
+    for (const k in (scans || {})) { const s = scans[k]; rows.push(["scan", T.cardNo, T.name, T.roomNo, new Date(s.at).toISOString(), s.result, s.by === "public" ? "public" : s.byName, s.dept, s.city, s.scanId]); }
+    for (const k in (notes || {})) { const n = notes[k]; rows.push(["note", T.cardNo, T.name, T.roomNo, new Date(n.at).toISOString(), n.tag, n.viewerName, n.dept, "", n.text]); }
+  }
+  rows.sort((a, b) => a[4] < b[4] ? 1 : -1);
+  const csv = rows.map(r => r.map(q).join(",")).join("\r\n");
+  return cors(new Response(csv, { headers: { "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": `attachment; filename="tenant-logs${tid ? "-" + tid : ""}.csv"` } }));
+}
+
 /* ============================ VIEWER ============================ */
 
 async function viewerScan(request, env, u) {
@@ -394,21 +541,24 @@ async function viewerScan(request, env, u) {
   if (token && token.startsWith("http")) token = token.split("/v/")[1] || token;   // full QR URL pasted
   const r = await resolveToken(env, token);
   const scanId = await logScan(env, request, r, { by: u.vid, byName: u.name, dept: u.dept, lat, lng });
-  if (!r.ok) return json({ ok: true, result: r.result, reason: r.reason, scanId });
+  if (!r.ok) return json({ ok: true, result: r.result, reason: r.reason, scanId, cardNo: r.T ? r.T.cardNo : null, name: r.T ? r.T.name : null, roomNo: r.T ? r.T.roomNo : null,
+    revokedAt: r.T ? r.T.revokedAt || null : null, validTill: r.T ? r.T.validTill : null, photoUrl: r.T && r.T.photo ? env.BASE_URL + "/photo/" + token : null });
 
   const { tid, T, P, L } = r;
+  const own = T.lid === u.lid;                   // vault / notes / history only for the landlord who created this login
+  const perms = own ? (u.perms || {}) : { vault: false, note: false, history: false };
   const out = {
-    ok: true, result: "valid", scanId, tid, cardNo: T.cardNo,
+    ok: true, result: "valid", scanId, tid, cardNo: T.cardNo, own,
     tenant: pick(T, ["name", "parentage", "dob", "permAddr", "phone", "emergency", "roomNo", "idDocType", "idDocLast4", "issuedAt", "validTill", "status"]),
     property: { address: P.address, policeStation: P.policeStation },
     landlord: { name: L.name, phone: L.phone },
     photoUrl: T.photo ? env.BASE_URL + "/photo/" + token : null,
     sigUrl: L.signature ? env.BASE_URL + "/sig/" + token : null,
     sealUrl: L.seal ? env.BASE_URL + "/seal/" + token : null,
-    perms: u.perms
+    perms
   };
-  if (u.perms?.vault) out.vault = await signedVault(env, tid, T.vault || []);
-  if (u.perms?.history) {
+  if (perms.vault) out.vault = await signedVault(env, tid, T.vault || []);
+  if (perms.history) {
     const [scans, notes] = await Promise.all([fbGet(env, "scans/" + tid), fbGet(env, "notes/" + tid)]);
     out.scans = scans || {}; out.notes = notes || {};
   }
@@ -423,7 +573,11 @@ async function viewerNote(request, env, u) {
   const tags = ["DOC_NOT_CLEAR", "SUSPECTED_FAKE", "ADDRESS_MISMATCH", "PERSON_MISMATCH", "OTHER"];
   if (!tags.includes(tag)) throw err(400, "tag must be one of " + tags.join(","));
   const nid = id("N");
-  await fbPut(env, "notes/" + tid + "/" + nid, { vid: u.vid, viewerName: u.name, dept: u.dept, tag, text: String(text || "").slice(0, 500), at: Date.now() });
+  const rec = { vid: u.vid, viewerName: u.name, dept: u.dept, tag, text: String(text || "").slice(0, 500), at: Date.now() };
+  await fbPut(env, "notes/" + tid + "/" + nid, rec);
+  await fbPut(env, "feed/" + T.lid + "/" + id("F"), { type: "note", at: rec.at, tid, cardNo: T.cardNo, name: T.name, roomNo: T.roomNo, by: u.vid, byName: u.name, dept: u.dept, tag, text: rec.text });
+  const L = await fbGet(env, "landlords/" + T.lid);
+  alertLandlord(env, L, `📝 Note on ${T.name} (Room ${T.roomNo}, ${T.cardNo})\n${tag.replace(/_/g, " ")} — ${u.name} (${u.dept})\n${rec.text}`, "note");
   return json({ ok: true, nid });
 }
 
@@ -519,11 +673,28 @@ async function logScan(env, request, r, extra) {
   };
   if (r.tid) {
     await fbPut(env, "scans/" + r.tid + "/" + id("S"), rec);
-    if (extra.by && extra.by !== "public") await fbPut(env, "viewerScans/" + extra.by + "/" + id("S"), { ...rec, tid: r.tid, cardNo: r.T?.cardNo });
+    if (extra.by && extra.by !== "public") await fbPut(env, "viewerScans/" + extra.by + "/" + id("S"), { ...rec, tid: r.tid, cardNo: r.T?.cardNo, name: r.T?.name, roomNo: r.T?.roomNo });
+    const f = { type: "scan", at: rec.at, tid: r.tid, cardNo: r.T?.cardNo, name: r.T?.name, roomNo: r.T?.roomNo, result: rec.result, reason: rec.reason, by: rec.by, byName: rec.byName, dept: rec.dept, city: rec.city, scanId };
+    await fbPut(env, "feed/" + r.T.lid + "/" + id("F"), f);
+    await fbPut(env, "adminFeed/" + id("F"), { ...f, lid: r.T.lid });
+    const who = rec.by === "public" ? "Public scan" : `${rec.byName} (${rec.dept})`;
+    alertLandlord(env, r.L, `${rec.result === "valid" ? "✅" : "❌"} ${rec.result.toUpperCase()} — ${r.T.name} (Room ${r.T.roomNo}, ${r.T.cardNo})\n${who}${rec.city ? " · " + rec.city : ""} · #${scanId}`, "scan");
   } else {
     await fbPut(env, "badScans/" + id("S"), rec);
   }
   return scanId;
+}
+
+/** Telegram message to the landlord's own chat (if they set it in Settings). Fire-and-forget. */
+function alertLandlord(env, L, text, kind) {
+  try {
+    if (!L || !L.tgChatId) return;
+    const a = L.alerts || { scan: true, note: true };
+    if (a[kind] === false) return;
+    const p = fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: L.tgChatId, text, disable_web_page_preview: true }) }).catch(() => {});
+    if (CTX && CTX.waitUntil) CTX.waitUntil(p);
+  } catch (e) {}
 }
 
 async function ownTenant(env, u, tid) {
@@ -600,6 +771,7 @@ function fbUrl(env, path, q) {
 async function fbGet(env, path, q) { const r = await fetch(fbUrl(env, path, q)); return r.json(); }
 async function fbPut(env, path, body) { const r = await fetch(fbUrl(env, path), { method: "PUT", body: JSON.stringify(body) }); if (!r.ok) throw err(500, "db write failed"); }
 async function fbPatch(env, path, body) { const r = await fetch(fbUrl(env, path), { method: "PATCH", body: JSON.stringify(body) }); if (!r.ok) throw err(500, "db write failed"); }
+async function fbDelete(env, path) { const r = await fetch(fbUrl(env, path), { method: "DELETE" }); if (!r.ok) throw err(500, "db delete failed"); }
 async function fbQuery(env, path, key, val) { return (await fbGet(env, path, { orderBy: JSON.stringify(key), equalTo: JSON.stringify(val) })) || {}; }
 
 /* ============================ CRYPTO ============================ */
