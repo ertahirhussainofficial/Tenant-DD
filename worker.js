@@ -38,15 +38,19 @@ async function route(request, env, ctx) {
   if ((x = match(p, "/c/:cardNo")) && m === "GET") return cardLookup(env, x.cardNo);
 
   // ---------- Auth ----------
+  if (p === "/auth/login" && m === "POST") return authAny(request, env);        // one login for all roles
   if (p === "/auth/landlord" && m === "POST") return authLandlord(request, env);
   if (p === "/auth/viewer" && m === "POST") return authViewer(request, env);
 
-  // ---------- Super admin (you) ----------
+  // ---------- Super admin (you): Firebase email+password login, or X-Admin-Key for curl ----------
   if (p.startsWith("/admin/")) {
-    if (request.headers.get("X-Admin-Key") !== env.ADMIN_KEY) throw err(401, "bad admin key");
+    if (request.headers.get("X-Admin-Key") !== env.ADMIN_KEY) await auth(request, env, "admin");
     if (p === "/admin/landlord" && m === "POST") return adminCreateLandlord(request, env);
-    if (p === "/admin/landlords" && m === "GET") return json({ ok: true, landlords: await fbGet(env, "landlords") });
+    if (p === "/admin/landlords" && m === "GET") return json({ ok: true, landlords: strip(await fbGet(env, "landlords")) });
     if ((x = match(p, "/admin/landlord/:lid")) && m === "PATCH") return adminPatchLandlord(request, env, x.lid);
+    if (p === "/admin/overview" && m === "GET") return adminOverview(env);
+    if ((x = match(p, "/admin/landlord/:lid/tenants")) && m === "GET") return json({ ok: true, tenants: withStatus(await fbQuery(env, "tenants", "lid", x.lid)) });
+    if ((x = match(p, "/admin/landlord/:lid/viewers")) && m === "GET") return json({ ok: true, viewers: strip(await fbQuery(env, "viewers", "lid", x.lid)) });
   }
 
   // ---------- Landlord ----------
@@ -96,6 +100,54 @@ async function route(request, env, ctx) {
 }
 
 /* ============================ AUTH ============================ */
+
+/** One login box: email → super-admin (Firebase Auth); digits → landlord phone; anything else → viewer loginId. */
+async function authAny(request, env) {
+  const b = await request.json();
+  const id = String(b.id || b.loginId || b.phone || b.email || "").trim();
+  const pw = String(b.password || b.pin || "").trim();
+  if (!id || !pw) throw err(400, "id and password required");
+
+  if (id.includes("@")) {
+    if (!env.FB_API_KEY) throw err(500, "FB_API_KEY not set");
+    const r = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${env.FB_API_KEY}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: id, password: pw, returnSecureToken: true })
+    });
+    const j = await r.json();
+    if (!r.ok || !j.localId) throw err(401, "login failed");
+    if (env.ADMIN_EMAILS && !env.ADMIN_EMAILS.toLowerCase().split(",").map(s => s.trim()).includes(id.toLowerCase())) throw err(403, "not an admin");
+    const token = await jwtSign(env, { role: "admin", email: id, name: j.displayName || id.split("@")[0] }, 12 * 3600);
+    return json({ ok: true, role: "admin", token, name: j.displayName || id.split("@")[0] });
+  }
+
+  if (/^\+?\d{8,15}$/.test(id)) {
+    const rows = await fbQuery(env, "landlords", "phone", id.replace(/^\+91/, ""));
+    const [lid, L] = Object.entries(rows)[0] || [];
+    if (L && L.status === "active" && await verifyPin(pw, L.pinHash, L.pinSalt)) {
+      const token = await jwtSign(env, { role: "landlord", lid, name: L.name }, 12 * 3600);
+      return json({ ok: true, role: "landlord", token, lid, name: L.name });
+    }
+  }
+
+  const rows = await fbQuery(env, "viewers", "loginId", id.toLowerCase());
+  const [vid, V] = Object.entries(rows)[0] || [];
+  if (!V || V.status !== "active") throw err(401, "login failed");
+  if (V.expiresAt && Date.now() > V.expiresAt) throw err(401, "access expired — contact landlord");
+  if (!(await verifyPin(pw, V.pinHash, V.pinSalt))) throw err(401, "login failed");
+  const token = await jwtSign(env, { role: "viewer", vid, lid: V.lid, name: V.name, dept: V.dept, perms: V.perms || {} }, 8 * 3600);
+  return json({ ok: true, role: "viewer", token, vid, name: V.name, dept: V.dept, perms: V.perms || {} });
+}
+
+async function adminOverview(env) {
+  const [L, T, V] = await Promise.all([fbGet(env, "landlords"), fbGet(env, "tenants"), fbGet(env, "viewers")]);
+  const out = { landlords: 0, tenants: 0, active: 0, revoked: 0, viewers: 0, perLandlord: {} };
+  for (const lid in (L || {})) { out.landlords++; out.perLandlord[lid] = { name: L[lid].name, phone: L[lid].phone, status: L[lid].status, tenants: 0, active: 0, viewers: 0 }; }
+  for (const tid in (T || {})) { const t = T[tid]; out.tenants++; const s = effStatus(t); if (s === "active") out.active++; if (s === "revoked") out.revoked++;
+    const pl = out.perLandlord[t.lid]; if (pl) { pl.tenants++; if (s === "active") pl.active++; } }
+  for (const vid in (V || {})) { out.viewers++; const pl = out.perLandlord[V[vid].lid]; if (pl) pl.viewers++; }
+  return json({ ok: true, ...out });
+}
 
 async function authLandlord(request, env) {
   const { phone, pin } = await request.json();

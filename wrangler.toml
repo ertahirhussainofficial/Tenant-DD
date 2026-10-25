@@ -18,6 +18,8 @@ BASE_URL = "https://tenant-verify.YOUR-SUBDOMAIN.workers.dev"
 #   FB_SECRET       Firebase > Project settings > Service accounts > Database secrets
 #   HMAC_SECRET     long random string (QR token signing)
 #   JWT_SECRET      long random string (app login tokens)
-#   ADMIN_KEY       long random string (your super-admin key)
+#   ADMIN_KEY       long random string (super-admin key for curl; app uses Firebase email login instead)
+#   FB_API_KEY      Firebase > Project settings > General > "Web API Key" (needed for super-admin email login)
+#   ADMIN_EMAILS    optional, comma-separated: only these Firebase Auth emails may log in as super-admin
 #   TG_BOT_TOKEN    from @BotFather
 #   TG_CHAT_ID      private channel id, e.g. -1001234567890 (bot must be admin)
