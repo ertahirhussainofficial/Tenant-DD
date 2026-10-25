@@ -31,6 +31,8 @@ async function route(request, env, ctx) {
   if ((x = match(p, "/v/:token")) && m === "GET") return publicPage(request, env, ctx, x.token, url);
   if ((x = match(p, "/api/v/:token")) && m === "GET") return publicJson(request, env, ctx, x.token, url);
   if ((x = match(p, "/photo/:token")) && m === "GET") return publicPhoto(env, x.token);
+  if ((x = match(p, "/sig/:token")) && m === "GET") return publicStamp(env, x.token, "signature");
+  if ((x = match(p, "/seal/:token")) && m === "GET") return publicStamp(env, x.token, "seal");
   if ((x = match(p, "/vault/:tid/:idx")) && m === "GET") return vaultFile(env, x.tid, x.idx, url);
   if ((x = match(p, "/c/:cardNo")) && m === "GET") return cardLookup(env, x.cardNo);
 
@@ -65,7 +67,9 @@ async function route(request, env, ctx) {
     if (p === "/landlord/viewer" && m === "POST") return createViewer(request, env, u);
     if ((x = match(p, "/landlord/viewer/:vid")) && m === "PATCH") return patchViewer(request, env, u, x.vid);
     if (p === "/landlord/viewers" && m === "GET") return json({ ok: true, viewers: strip(await fbQuery(env, "viewers", "lid", u.lid)) });
-    if (p === "/landlord/signature" && m === "POST") return uploadSignature(request, env, u);
+    if (p === "/landlord/signature" && m === "POST") return uploadLandlordImage(request, env, u, "signature");
+    if (p === "/landlord/seal" && m === "POST") return uploadLandlordImage(request, env, u, "seal");
+    if ((x = match(p, "/landlord/image/:kind")) && m === "GET") return landlordImage(env, u, x.kind);
   }
 
   // ---------- Viewer (police / administration) ----------
@@ -225,11 +229,27 @@ async function uploadPhoto(request, env, u, tid) {
   return json({ ok: true, photo: tg });
 }
 
-async function uploadSignature(request, env, u) {
+// kind = "signature" | "seal" — transparent PNGs the app composites onto the card
+async function uploadLandlordImage(request, env, u, kind) {
   const f = await getFile(request);
-  const tg = await tgUpload(env, f, `signature ${u.lid}`);
-  await fbPatch(env, "landlords/" + u.lid, { signature: tg });
-  return json({ ok: true, signature: tg });
+  if (!/png/i.test(f.type || "") && !/\.png$/i.test(f.name || "")) throw err(400, kind + " must be a transparent PNG");
+  const tg = await tgUpload(env, f, `${kind} ${u.lid}`);
+  await fbPatch(env, "landlords/" + u.lid, { [kind]: tg });
+  return json({ ok: true, [kind]: tg });
+}
+
+// public: signature/seal shown on the verify page, keyed by a valid card token (not guessable)
+async function publicStamp(env, token, kind) {
+  const r = await resolveToken(env, token);
+  if (!r.L || !r.L[kind]) throw err(404, "no " + kind);
+  return tgServe(env, r.L[kind].file_id, "image/png");
+}
+
+async function landlordImage(env, u, kind) {
+  if (kind !== "signature" && kind !== "seal") throw err(404, "not found");
+  const L = await fbGet(env, "landlords/" + u.lid);
+  if (!L || !L[kind]) throw err(404, "no " + kind + " uploaded");
+  return tgServe(env, L[kind].file_id, "image/png");
 }
 
 async function uploadVault(request, env, u, tid) {
@@ -307,6 +327,8 @@ async function viewerScan(request, env, u) {
     property: { address: P.address, policeStation: P.policeStation },
     landlord: { name: L.name, phone: L.phone },
     photoUrl: T.photo ? env.BASE_URL + "/photo/" + token : null,
+    sigUrl: L.signature ? env.BASE_URL + "/sig/" + token : null,
+    sealUrl: L.seal ? env.BASE_URL + "/seal/" + token : null,
     perms: u.perms
   };
   if (u.perms?.vault) out.vault = await signedVault(env, tid, T.vault || []);
@@ -353,7 +375,9 @@ function publicPayload(env, r, token, scanId) {
     roomNo: T.roomNo, roomAddr: P.address, permAddr: T.permAddr,
     policeStation: P.policeStation, landlord: L.name,
     issuedAt: T.issuedAt, validTill: T.validTill, revokedAt: T.revokedAt || null,
-    photoUrl: T.photo ? env.BASE_URL + "/photo/" + token : null
+    photoUrl: T.photo ? env.BASE_URL + "/photo/" + token : null,
+    sigUrl: L.signature ? env.BASE_URL + "/sig/" + token : null,
+    sealUrl: L.seal ? env.BASE_URL + "/seal/" + token : null
   };
 }
 
@@ -611,7 +635,8 @@ function verifyPage(env, d, token) {
   <div class="hd"><div><div class="t1">TENANT IDENTITY CARD</div><div class="t2">Issued by ${esc(d.landlord)} (Landlord)</div></div>
     <div class="room"><div class="rl">ROOM</div><div class="rn">${esc(d.roomNo)}</div></div></div>
   <div class="bd">
-    <div class="ph">${d.photoUrl ? `<img src="${esc(d.photoUrl)}" alt="Tenant photo">` : `<span>NO PHOTO</span>`}</div>
+    <div class="phw"><div class="ph">${d.photoUrl ? `<img src="${esc(d.photoUrl)}" alt="Tenant photo">` : `<span>NO PHOTO</span>`}</div>
+      ${d.sealUrl ? `<img class="stp seal1" src="${esc(d.sealUrl)}" alt="">` : ""}${d.sigUrl ? `<img class="stp sig1" src="${esc(d.sigUrl)}" alt="">` : ""}</div>
     <div class="f">
       <div><label>NAME</label><b class="nm">${esc(d.name)}</b></div>
       <div><label>FATHER'S / HUSBAND'S NAME</label><b>${esc(d.parentage)}</b></div>
@@ -622,7 +647,8 @@ function verifyPage(env, d, token) {
     <div><label>${valid ? "RENTED ROOM ADDRESS" : "WAS REGISTERED AT"}</label><span>Room ${esc(d.roomNo)}, ${esc(d.roomAddr)}</span></div>
     <div><label>PERMANENT ADDRESS</label><span>${esc(d.permAddr)}</span></div>
     <div><label>POLICE STATION</label><b>${esc(d.policeStation || "—")}</b></div>
-    <div class="row"><div><label>CARD NO.</label><b>${esc(d.cardNo)}</b></div><div><label>${valid ? "VALID TILL" : "PERIOD"}</label><b style="color:${col}">${valid ? fmtDate(d.validTill) : fmtDate(d.issuedAt) + " – " + fmtDate(d.revokedAt || d.validTill)}</b></div></div>
+    <div class="row"><div><label>CARD NO.</label><b>${esc(d.cardNo)}</b></div><div><label>${valid ? "VALID TILL" : "PERIOD"}</label><b style="color:${col}">${valid ? fmtDate(d.validTill) : fmtDate(d.issuedAt) + " – " + fmtDate(d.revokedAt || d.validTill)}</b></div>
+      <div class="sgw"><div class="sgb">${d.sigUrl ? `<img class="stp sig2" src="${esc(d.sigUrl)}" alt="Landlord signature">` : ""}</div><label>LANDLORD</label>${d.sealUrl ? `<img class="stp seal2" src="${esc(d.sealUrl)}" alt="Landlord seal">` : ""}</div></div>
   </div>
   <div class="ft"></div>
 </div>` : `<div class="card dim"><div class="bd2"><b>No card data</b><span>${esc(reasonText)}</span></div></div>`;
@@ -640,6 +666,10 @@ function verifyPage(env, d, token) {
 .hd{background:#1B3A6B;color:#fff;padding:12px 14px;display:flex;justify-content:space-between;align-items:center;gap:8px}.t1{font-size:12px;font-weight:800;letter-spacing:1px}.t2{font-size:9px;opacity:.85}
 .room{background:#fff;color:#1B3A6B;border-radius:8px;padding:6px 10px;text-align:center;line-height:1}.rl{font-size:8px;font-weight:700;letter-spacing:1px}.rn{font-size:20px;font-weight:900}
 .bd{display:flex;gap:12px;padding:12px 14px}.ph{width:92px;height:112px;border-radius:8px;background:#F2F4F7;border:1px solid #D9DEE7;flex-shrink:0;overflow:hidden;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:600;color:#5A6478}.ph img{width:100%;height:100%;object-fit:cover}
+.phw{position:relative;width:92px;height:112px;flex-shrink:0}.stp{position:absolute;pointer-events:none;object-fit:contain}
+.seal1{width:52px;height:52px;right:-12px;bottom:-12px;transform:rotate(-14deg);opacity:.78}.sig1{width:60px;height:26px;right:0;bottom:14px;transform:rotate(-8deg);opacity:.92}
+.sgw{position:relative;display:flex;flex-direction:column;align-items:center;gap:1px}.sgb{width:110px;height:34px;border-bottom:1.5px solid #141413;display:flex;align-items:flex-end;justify-content:center}
+.sig2{position:static;width:84px;height:30px;margin-left:16px;transform:rotate(-3deg)}.seal2{width:54px;height:54px;left:-10px;top:-18px;transform:rotate(12deg);opacity:.78}
 .f{display:flex;flex-direction:column;gap:7px;min-width:0;flex:1}.f div,.bd2>div{display:flex;flex-direction:column;gap:1px}
 label{font-size:9px;font-weight:600;color:#5A6478;letter-spacing:1px}b{font-size:13px;font-weight:600}b.nm{font-size:17px;font-weight:800}span{font-size:12px;font-weight:500;line-height:1.35}
 .bd2{padding:0 14px 12px;display:flex;flex-direction:column;gap:8px}.row{flex-direction:row!important;justify-content:space-between;gap:10px}.row>div{display:flex;flex-direction:column;gap:1px}
