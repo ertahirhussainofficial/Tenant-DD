@@ -37,6 +37,7 @@ async function route(request, env, ctx) {
   if ((x = match(p, "/photo/:token")) && m === "GET") return publicPhoto(env, x.token);
   if ((x = match(p, "/sig/:token")) && m === "GET") return publicStamp(env, x.token, "signature");
   if ((x = match(p, "/seal/:token")) && m === "GET") return publicStamp(env, x.token, "seal");
+  if ((x = match(p, "/logo/:token")) && m === "GET") return publicLogo(env, x.token);
   if ((x = match(p, "/vault/:tid/:idx")) && m === "GET") return vaultFile(env, x.tid, x.idx, url);
   if ((x = match(p, "/c/:cardNo")) && m === "GET") return cardLookup(env, x.cardNo);
   if (p === "/app/version" && m === "GET") return json({ ok: true, version: Number(env.APP_VERSION || 1), apkUrl: env.APK_URL || "", notes: env.APP_NOTES || "" });
@@ -93,6 +94,7 @@ async function route(request, env, ctx) {
       const P = await fbGet(env, "properties/" + T.pid);
       return json({ ok: true, tenant: { ...T, effStatus: effStatus(T) }, token, qrUrl: env.BASE_URL + "/v/" + token,
         property: P || {}, landlord: { name: L.name, phone: L.phone, helpline: L.helpline || "", hasSignature: !!L.signature, hasSeal: !!L.seal },
+        card: cardSettings(env, L, P || {}), logoUrl: P && P.logo ? env.BASE_URL + "/logo/" + token : null,
         photoUrl: T.photo ? env.BASE_URL + "/photo/" + token : null,
         sigUrl: L.signature ? env.BASE_URL + "/sig/" + token : null,
         sealUrl: L.seal ? env.BASE_URL + "/seal/" + token : null });
@@ -110,6 +112,9 @@ async function route(request, env, ctx) {
     if (p === "/landlord/signature" && m === "POST") return uploadLandlordImage(request, env, u, "signature");
     if (p === "/landlord/seal" && m === "POST") return uploadLandlordImage(request, env, u, "seal");
     if ((x = match(p, "/landlord/image/:kind")) && m === "GET") return landlordImage(env, u, x.kind);
+    if ((x = match(p, "/landlord/property/:pid/logo")) && m === "POST") return uploadPropertyLogo(request, env, u, x.pid);
+    if ((x = match(p, "/landlord/property/:pid/logo")) && m === "DELETE") { const P = await fbGet(env, "properties/" + x.pid); if (!P || P.lid !== u.lid) throw err(404, "property not found"); await fbPatch(env, "properties/" + x.pid, { logo: null }); return json({ ok: true }); }
+    if ((x = match(p, "/landlord/property/:pid/logo")) && m === "GET") { const P = await fbGet(env, "properties/" + x.pid); if (!P || P.lid !== u.lid || !P.logo) throw err(404, "no logo"); return tgServe(env, P.logo.file_id, P.logo.mime); }
   }
 
   // ---------- Viewer (police / administration) ----------
@@ -118,6 +123,8 @@ async function route(request, env, ctx) {
     if (p === "/viewer/me" && m === "GET") return json({ ok: true, me: strip1(await fbGet(env, "viewers/" + u.vid)) });
     if (p === "/viewer/scan" && m === "POST") return viewerScan(request, env, u);
     if (p === "/viewer/note" && m === "POST") return viewerNote(request, env, u);
+    if (p === "/viewer/tenants" && m === "GET") return viewerTenants(env, u);
+    if ((x = match(p, "/viewer/tenant/:tid")) && m === "GET") return viewerTenant(request, env, u, x.tid);
     if (p === "/viewer/myscans" && m === "GET") return json({ ok: true, scans: await fbGet(env, "viewerScans/" + u.vid, { orderBy: '"at"', limitToLast: 100 }) });
   }
 
@@ -335,10 +342,41 @@ async function patchTenant(request, env, u, tid) {
 
 async function uploadPhoto(request, env, u, tid) {
   await ownTenant(env, u, tid);
-  const f = await getFile(request);
+  const form = await request.formData();
+  const f = form.get("file"); if (!f || typeof f === "string") throw err(400, "multipart field 'file' required");
+  const thumb = String(form.get("thumb") || "");                     // tiny base64 JPEG made by the app → instant list thumbnails
   const tg = await tgUpload(env, f, `photo ${tid}`);
-  await fbPatch(env, "tenants/" + tid, { photo: tg });
+  const patch = { photo: tg }; if (thumb.startsWith("data:image/jpeg;base64,") && thumb.length < 16000) patch.thumb = thumb;
+  await fbPatch(env, "tenants/" + tid, patch);
   return json({ ok: true, photo: tg });
+}
+
+/* ---- card appearance defaults; landlord can override in the app (More → Card settings) ---- */
+const CARD_DEFAULTS = {
+  title: "IDENTITY CARD",
+  issuedBy: "Issued by {landlord} (Landlord) · {address}",
+  instructions: "Return this card when vacating · Non-transferable · Validity is checked live by QR — a cancelled card scans NOT VALID",
+  watermark: "{landlord} · VERIFY BY QR"
+};
+function cardSettings(env, L, P) {
+  const c = { ...CARD_DEFAULTS, ...((L && L.card) || {}) };
+  const fill = v => String(v || "").replace(/\{landlord\}/g, (L && L.name) || "").replace(/\{address\}/g, (P && P.address) || "").replace(/\{property\}/g, (P && (P.label || P.address)) || "")
+    .replace(/\{phone\}/g, (L && L.phone) || "").replace(/\{police\}/g, (P && P.policeStation) || "").replace(/\{site\}/g, String(env.BASE_URL || "").replace(/^https?:\/\//, ""));
+  return { title: fill(c.title), issuedBy: fill(c.issuedBy), instructions: fill(c.instructions), watermark: fill(c.watermark) };
+}
+
+async function uploadPropertyLogo(request, env, u, pid) {
+  const P = await fbGet(env, "properties/" + pid);
+  if (!P || P.lid !== u.lid) throw err(404, "property not found");
+  const f = await getFile(request);
+  const tg = await tgUpload(env, f, `logo ${pid}`);
+  await fbPatch(env, "properties/" + pid, { logo: tg });
+  return json({ ok: true, logo: tg });
+}
+async function publicLogo(env, token) {
+  const r = await resolveToken(env, token);
+  if (!r.P || !r.P.logo) throw err(404, "no logo");
+  return tgServe(env, r.P.logo.file_id, r.P.logo.mime);
 }
 
 // kind = "signature" | "seal" — transparent PNGs the app composites onto the card
@@ -431,6 +469,7 @@ async function patchMe(request, env, u) {
   if (b.tgChatId !== undefined) patch.tgChatId = String(b.tgChatId || "");
   if (b.alerts) patch.alerts = { scan: !!b.alerts.scan, note: !!b.alerts.note };
   if (b.helpline !== undefined) patch.helpline = String(b.helpline || "");
+  if (b.card && typeof b.card === "object") { const c = {}; for (const k of ["title", "issuedBy", "instructions", "watermark"]) if (b.card[k] !== undefined) c[k] = String(b.card[k] || "").slice(0, 220); patch.card = { ...((await fbGet(env, "landlords/" + u.lid + "/card")) || {}), ...c }; }
   await fbPatch(env, "landlords/" + u.lid, patch);
   return json({ ok: true });
 }
@@ -565,6 +604,36 @@ async function viewerScan(request, env, u) {
   return json(out);
 }
 
+/** Read-only list of the landlord's tenants for an official login (basic fields + thumbnail). */
+async function viewerTenants(env, u) {
+  const rows = await fbQuery(env, "tenants", "lid", u.lid);
+  const props = await fbQuery(env, "properties", "lid", u.lid);
+  const out = {};
+  for (const tid in rows) { const T = rows[tid]; const P = props[T.pid] || {};
+    out[tid] = { name: T.name, parentage: T.parentage, roomNo: T.roomNo, cardNo: T.cardNo, status: effStatus(T), thumb: T.thumb || null, address: P.address || "", pid: T.pid, createdAt: T.createdAt, validTill: T.validTill }; }
+  return json({ ok: true, tenants: out, landlord: u.lid });
+}
+
+/** Full details opened from the list (same payload as a scan; logged as a "list view"). */
+async function viewerTenant(request, env, u, tid) {
+  const T = await fbGet(env, "tenants/" + tid);
+  if (!T || T.lid !== u.lid) throw err(404, "tenant not found");
+  const token = await cardToken(env, tid, T.tokenVer || 1);
+  const r = await resolveToken(env, token);
+  const scanId = await logScan(env, request, r, { by: u.vid, byName: u.name, dept: u.dept, via: "list" });
+  const { P, L } = r; const perms = u.perms || {};
+  const out = {
+    ok: true, result: r.result, reason: r.reason || null, scanId, tid, cardNo: T.cardNo, own: true, viaList: true,
+    tenant: pick(T, ["name", "parentage", "dob", "permAddr", "phone", "emergency", "roomNo", "idDocType", "idDocLast4", "issuedAt", "validTill", "status"]),
+    property: { address: P.address, policeStation: P.policeStation }, landlord: { name: L.name, phone: L.phone },
+    photoUrl: T.photo ? env.BASE_URL + "/photo/" + token : null, sigUrl: L.signature ? env.BASE_URL + "/sig/" + token : null, sealUrl: L.seal ? env.BASE_URL + "/seal/" + token : null,
+    revokedAt: T.revokedAt || null, perms
+  };
+  if (perms.vault) out.vault = await signedVault(env, tid, T.vault || []);
+  if (perms.history) { const [scans, notes] = await Promise.all([fbGet(env, "scans/" + tid), fbGet(env, "notes/" + tid)]); out.scans = scans || {}; out.notes = notes || {}; }
+  return json(out);
+}
+
 async function viewerNote(request, env, u) {
   if (!u.perms?.note) throw err(403, "notes not allowed for your login");
   const { tid, tag, text } = await request.json();
@@ -603,8 +672,11 @@ function publicPayload(env, r, token, scanId) {
     ...base,
     cardNo: T.cardNo, name: T.name, parentage: T.parentage, dob: T.dob,
     roomNo: T.roomNo, roomAddr: P.address, permAddr: T.permAddr,
-    policeStation: P.policeStation, landlord: L.name,
+    policeStation: P.policeStation, landlord: L.name, landlordPhone: L.phone || "", mobile: T.phone || "",
+    idDoc: (T.idDocType || "") + (T.idDocLast4 ? " · XXXX " + T.idDocLast4 : ""),
     issuedAt: T.issuedAt, validTill: T.validTill, revokedAt: T.revokedAt || null,
+    card: cardSettings(env, L, P),
+    logoUrl: P.logo ? env.BASE_URL + "/logo/" + token : null,
     photoUrl: T.photo ? env.BASE_URL + "/photo/" + token : null,
     sigUrl: L.signature ? env.BASE_URL + "/sig/" + token : null,
     sealUrl: L.seal ? env.BASE_URL + "/seal/" + token : null
@@ -664,7 +736,7 @@ async function logScan(env, request, r, extra) {
   const cf = request.cf || {};
   const rec = {
     scanId, at: Date.now(), result: r.result, reason: r.reason || null,
-    by: extra.by, byName: extra.byName || null, dept: extra.dept || null,
+    by: extra.by, byName: extra.byName || null, dept: extra.dept || null, via: extra.via || "scan",
     ip: request.headers.get("CF-Connecting-IP") || null,
     city: cf.city || null, region: cf.region || null, country: cf.country || null,
     lat: extra.lat ? Number(extra.lat) : (cf.latitude ? Number(cf.latitude) : null),
@@ -674,10 +746,10 @@ async function logScan(env, request, r, extra) {
   if (r.tid) {
     await fbPut(env, "scans/" + r.tid + "/" + id("S"), rec);
     if (extra.by && extra.by !== "public") await fbPut(env, "viewerScans/" + extra.by + "/" + id("S"), { ...rec, tid: r.tid, cardNo: r.T?.cardNo, name: r.T?.name, roomNo: r.T?.roomNo });
-    const f = { type: "scan", at: rec.at, tid: r.tid, cardNo: r.T?.cardNo, name: r.T?.name, roomNo: r.T?.roomNo, result: rec.result, reason: rec.reason, by: rec.by, byName: rec.byName, dept: rec.dept, city: rec.city, scanId };
+    const f = { type: "scan", via: rec.via, at: rec.at, tid: r.tid, cardNo: r.T?.cardNo, name: r.T?.name, roomNo: r.T?.roomNo, result: rec.result, reason: rec.reason, by: rec.by, byName: rec.byName, dept: rec.dept, city: rec.city, scanId };
     await fbPut(env, "feed/" + r.T.lid + "/" + id("F"), f);
     await fbPut(env, "adminFeed/" + id("F"), { ...f, lid: r.T.lid });
-    const who = rec.by === "public" ? "Public scan" : `${rec.byName} (${rec.dept})`;
+    const who = rec.by === "public" ? "Public scan" : `${rec.byName} (${rec.dept})${rec.via === "list" ? " viewed from list" : ""}`;
     alertLandlord(env, r.L, `${rec.result === "valid" ? "✅" : "❌"} ${rec.result.toUpperCase()} — ${r.T.name} (Room ${r.T.roomNo}, ${r.T.cardNo})\n${who}${rec.city ? " · " + rec.city : ""} · #${scanId}`, "scan");
   } else {
     await fbPut(env, "badScans/" + id("S"), rec);
@@ -742,15 +814,20 @@ async function tgUpload(env, file, caption) {
   return { file_id: d.file_id, name: d.file_name || file.name || "file", mime: d.mime_type || file.type || "application/octet-stream", size: d.file_size || file.size || 0, msg: j.result.message_id };
 }
 
+/** Serves a Telegram-stored file. Bytes are cached at the Cloudflare edge for a day (keyed by file_id), so repeat loads skip Telegram entirely. */
 async function tgServe(env, fileId, mime, name) {
+  const h = new Headers({ "Content-Type": mime || "application/octet-stream", "Cache-Control": "private, max-age=3600", "X-Content-Type-Options": "nosniff" });
+  if (name) h.set("Content-Disposition", `inline; filename="${name.replace(/"/g, "")}"`);
+  let cache = null, key = null;
+  try { cache = caches.default; key = new Request("https://tg-cache.internal/" + encodeURIComponent(fileId)); const hit = await cache.match(key); if (hit) return cors(new Response(hit.body, { status: 200, headers: h })); } catch (e) { cache = null; }
   const r = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/getFile?file_id=${encodeURIComponent(fileId)}`);
   const j = await r.json();
   if (!j.ok) throw err(502, "telegram getFile failed");
   const f = await fetch(`https://api.telegram.org/file/bot${env.TG_BOT_TOKEN}/${j.result.file_path}`);
   if (!f.ok) throw err(502, "telegram download failed");
-  const h = new Headers({ "Content-Type": mime || "application/octet-stream", "Cache-Control": "private, max-age=60", "X-Content-Type-Options": "nosniff" });
-  if (name) h.set("Content-Disposition", `inline; filename="${name.replace(/"/g, "")}"`);
-  return cors(new Response(f.body, { status: 200, headers: h }));
+  const buf = await f.arrayBuffer();
+  if (cache) { try { const p = cache.put(key, new Response(buf.slice(0), { headers: { "Content-Type": mime || "application/octet-stream", "Cache-Control": "public, max-age=86400" } })); if (CTX && CTX.waitUntil) CTX.waitUntil(p); } catch (e) {} }
+  return cors(new Response(buf, { status: 200, headers: h }));
 }
 
 async function getFile(request) {
@@ -883,28 +960,43 @@ function verifyPage(env, d, token) {
     FAKE_OR_DAMAGED: "QR code is not genuine or is damaged",
     UNKNOWN_CARD: "Card not found"
   }[d.reason] || (valid ? "Active tenant · verified live just now" : "");
+  const c = d.card || {};
+  const seed = hashSeed(d.cardNo || "x");
+  const rot = (base, spread, i) => (base + ((seed >> (i * 5)) % 100) / 100 * spread).toFixed(1);
 
   const card = d.cardNo ? `
 <div class="card ${valid ? "" : "dim"}">
-  <div class="hd"><div><div class="t1">TENANT IDENTITY CARD</div><div class="t2">Issued by ${esc(d.landlord)} (Landlord)</div></div>
-    <div class="room"><div class="rl">ROOM</div><div class="rn">${esc(d.roomNo)}</div></div></div>
+  <div class="hd">
+    ${d.logoUrl ? `<img class="logo" src="${esc(d.logoUrl)}" alt="">` : `<div class="logo ph">ID</div>`}
+    <div class="hdt"><div class="t1">${esc(c.title || "IDENTITY CARD")}</div><div class="t2">${esc(c.issuedBy || "")}</div></div>
+    <div class="room"><div class="rl">ROOM</div><div class="rn">${esc(d.roomNo)}</div></div>
+  </div>
   <div class="bd">
-    <div class="phw"><div class="ph">${d.photoUrl ? `<img src="${esc(d.photoUrl)}" alt="Tenant photo">` : `<span>NO PHOTO</span>`}</div>
-      ${d.sealUrl ? `<img class="stp seal1" src="${esc(d.sealUrl)}" alt="">` : ""}${d.sigUrl ? `<img class="stp sig1" src="${esc(d.sigUrl)}" alt="">` : ""}</div>
+    <div class="phw">
+      <div class="ph">${d.photoUrl ? `<img src="${esc(d.photoUrl)}" alt="Tenant photo">` : `<span>NO PHOTO</span>`}</div>
+      ${d.sealUrl ? `<img class="stp seal1" style="transform:rotate(${rot(-24, 14, 0)}deg)" src="${esc(d.sealUrl)}" alt="">` : ""}${d.sigUrl ? `<img class="stp sig1" style="transform:rotate(${rot(-14, 10, 1)}deg)" src="${esc(d.sigUrl)}" alt="">` : ""}
+    </div>
     <div class="f">
       <div><label>NAME</label><b class="nm">${esc(d.name)}</b></div>
       <div><label>FATHER'S / HUSBAND'S NAME</label><b>${esc(d.parentage)}</b></div>
       <div><label>DATE OF BIRTH</label><b>${esc(d.dob)}</b></div>
+      <div><label>PERMANENT ADDRESS</label><span>${esc(d.permAddr)}</span></div>
+      <div><label>ID DOCUMENT</label><b>${esc(d.idDoc || "—")}</b></div>
+      <div><label>MOBILE</label><b>${esc(d.mobile || "—")}</b></div>
     </div>
   </div>
   <div class="bd2">
-    <div><label>${valid ? "RENTED ROOM ADDRESS" : "WAS REGISTERED AT"}</label><span>Room ${esc(d.roomNo)}, ${esc(d.roomAddr)}</span></div>
-    <div><label>PERMANENT ADDRESS</label><span>${esc(d.permAddr)}</span></div>
-    <div><label>POLICE STATION</label><b>${esc(d.policeStation || "—")}</b></div>
-    <div class="row"><div><label>CARD NO.</label><b>${esc(d.cardNo)}</b></div><div><label>${valid ? "VALID TILL" : "PERIOD"}</label><b style="color:${col}">${valid ? fmtDate(d.validTill) : fmtDate(d.issuedAt) + " – " + fmtDate(d.revokedAt || d.validTill)}</b></div>
-      <div class="sgw"><div class="sgb">${d.sigUrl ? `<img class="stp sig2" src="${esc(d.sigUrl)}" alt="Landlord signature">` : ""}</div><label>LANDLORD</label>${d.sealUrl ? `<img class="stp seal2" src="${esc(d.sealUrl)}" alt="Landlord seal">` : ""}</div></div>
+    <div><label>${valid ? "ROOM ADDRESS" : "WAS REGISTERED AT"}</label><span>Room ${esc(d.roomNo)}, ${esc(d.roomAddr)}</span></div>
+    <div class="row"><div><label>LANDLORD</label><b>${esc(d.landlord)}</b></div><div><label>LANDLORD MOBILE</label><b>${esc(d.landlordPhone || "—")}</b></div></div>
+    <div class="row"><div><label>POLICE STATION</label><b>${esc(d.policeStation || "—")}</b></div><div><label>CARD NO.</label><b>${esc(d.cardNo)}</b></div></div>
+    <div class="sgw">
+      <div class="sgname">${esc(d.landlord)}</div>
+      ${d.sigUrl ? `<img class="stp sig2" style="transform:rotate(${rot(-5, 6, 2)}deg)" src="${esc(d.sigUrl)}" alt="Landlord signature">` : ""}
+      ${d.sealUrl ? `<img class="stp seal2" style="transform:rotate(${rot(4, 14, 3)}deg)" src="${esc(d.sealUrl)}" alt="Landlord seal">` : ""}
+    </div>
   </div>
-  <div class="ft"></div>
+  <div class="ft">${esc(c.instructions || "")}</div>
+  <div class="wmk" aria-hidden="true">${Array(6).fill(`<div>${esc(c.watermark || "")} · ${esc(c.watermark || "")}</div>`).join("")}</div>
 </div>` : `<div class="card dim"><div class="bd2"><b>No card data</b><span>${esc(reasonText)}</span></div></div>`;
 
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"><title>${word} · ${esc(env.APP_NAME)}</title>
@@ -912,22 +1004,23 @@ function verifyPage(env, d, token) {
 <style>
 :root{--c:${col};--bg:${bg}}
 *{box-sizing:border-box}body{margin:0;font-family:Inter,system-ui,sans-serif;background:var(--bg);color:#141413;min-height:100vh;position:relative;overflow-x:hidden;-webkit-user-select:none;user-select:none}
-.wm{position:fixed;inset:-40%;display:flex;flex-direction:column;gap:70px;transform:rotate(-32deg);color:var(--c);opacity:.14;font-size:84px;font-weight:900;letter-spacing:6px;white-space:nowrap;pointer-events:none;z-index:0}
-.band{position:fixed;left:0;right:0;top:0;height:6px;background:var(--c);animation:pulse 3s infinite;z-index:3}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+.wm{position:fixed;inset:-40%;display:flex;flex-direction:column;gap:70px;transform:rotate(-32deg);color:var(--c);opacity:.16;font-size:84px;font-weight:900;letter-spacing:6px;white-space:nowrap;pointer-events:none;z-index:5}
+.band{position:fixed;left:0;right:0;top:0;height:6px;background:var(--c);animation:pulse 3s infinite;z-index:6}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
 .wrap{position:relative;z-index:1;max-width:430px;margin:0 auto;padding:22px 16px 24px;display:flex;flex-direction:column;gap:12px;min-height:100vh}
 .st{display:flex;align-items:center;gap:12px;color:var(--c)}.st svg{width:40px;height:40px;flex-shrink:0}.st .w{font-size:30px;font-weight:900;letter-spacing:2px;line-height:1}.st .s{font-size:12px;font-weight:600;opacity:.85}
-.card{background:#fff;border-radius:16px;overflow:hidden;border:2px solid var(--c);box-shadow:0 8px 24px rgba(0,0,0,.12)}.card.dim{filter:grayscale(.6);opacity:.92}
-.hd{background:#1B3A6B;color:#fff;padding:12px 14px;display:flex;justify-content:space-between;align-items:center;gap:8px}.t1{font-size:12px;font-weight:800;letter-spacing:1px}.t2{font-size:9px;opacity:.85}
-.room{background:#fff;color:#1B3A6B;border-radius:8px;padding:6px 10px;text-align:center;line-height:1}.rl{font-size:8px;font-weight:700;letter-spacing:1px}.rn{font-size:20px;font-weight:900}
-.bd{display:flex;gap:12px;padding:12px 14px}.ph{width:92px;height:112px;border-radius:8px;background:#F2F4F7;border:1px solid #D9DEE7;flex-shrink:0;overflow:hidden;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:600;color:#5A6478}.ph img{width:100%;height:100%;object-fit:cover}
-.phw{position:relative;width:92px;height:112px;flex-shrink:0}.stp{position:absolute;pointer-events:none;object-fit:contain}
-.seal1{width:52px;height:52px;right:-12px;bottom:-12px;transform:rotate(-14deg);opacity:.78}.sig1{width:60px;height:26px;right:0;bottom:14px;transform:rotate(-8deg);opacity:.92}
-.sgw{position:relative;display:flex;flex-direction:column;align-items:center;gap:1px}.sgb{width:110px;height:34px;border-bottom:1.5px solid #141413;display:flex;align-items:flex-end;justify-content:center}
-.sig2{position:static;width:84px;height:30px;margin-left:16px;transform:rotate(-3deg)}.seal2{width:54px;height:54px;left:-10px;top:-18px;transform:rotate(12deg);opacity:.78}
-.f{display:flex;flex-direction:column;gap:7px;min-width:0;flex:1}.f div,.bd2>div{display:flex;flex-direction:column;gap:1px}
-label{font-size:9px;font-weight:600;color:#5A6478;letter-spacing:1px}b{font-size:13px;font-weight:600}b.nm{font-size:17px;font-weight:800}span{font-size:12px;font-weight:500;line-height:1.35}
-.bd2{padding:0 14px 12px;display:flex;flex-direction:column;gap:8px}.row{flex-direction:row!important;justify-content:space-between;gap:10px}.row>div{display:flex;flex-direction:column;gap:1px}
-.ft{height:6px;background:#1B3A6B}
+.card{position:relative;background:#fff;border-radius:16px;overflow:hidden;border:2px solid var(--c);box-shadow:0 8px 24px rgba(0,0,0,.12)}.card.dim{filter:grayscale(.6);opacity:.92}
+.card .wmk{position:absolute;inset:-30%;display:flex;flex-direction:column;gap:38px;transform:rotate(-28deg);color:#1B3A6B;opacity:.07;font-size:22px;font-weight:800;letter-spacing:3px;white-space:nowrap;pointer-events:none;z-index:0}
+.card>*:not(.wmk){position:relative;z-index:1}
+.hd{background:#1B3A6B;color:#fff;padding:10px 12px;display:flex;align-items:center;gap:10px}.logo{width:40px;height:40px;border-radius:9px;object-fit:cover;background:#fff;flex-shrink:0}.logo.ph{display:flex;align-items:center;justify-content:center;color:#1B3A6B;font-weight:900;font-size:13px}
+.hdt{flex:1;min-width:0}.t1{font-size:13px;font-weight:800;letter-spacing:1.5px}.t2{font-size:9px;opacity:.85;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.room{background:#fff;color:#1B3A6B;border-radius:8px;padding:5px 9px;text-align:center;line-height:1}.rl{font-size:7px;font-weight:700;letter-spacing:1px}.rn{font-size:18px;font-weight:900}
+.bd{display:flex;gap:12px;padding:12px 12px 4px}.phw{position:relative;width:96px;height:116px;flex-shrink:0}.ph{width:96px;height:116px;border-radius:8px;background:#F2F4F7;border:1px solid #D9DEE7;overflow:hidden;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:600;color:#5A6478}.ph img{width:100%;height:100%;object-fit:cover}
+.stp{position:absolute;pointer-events:none;object-fit:contain}.seal1{width:54px;height:54px;left:-16px;bottom:-14px;opacity:.78}.sig1{width:62px;height:26px;left:8px;bottom:10px;opacity:.92}
+.f{display:flex;flex-direction:column;gap:6px;min-width:0;flex:1}.f>div,.bd2>div{display:flex;flex-direction:column;gap:1px}
+label{font-size:8.5px;font-weight:700;color:#5A6478;letter-spacing:1px}b{font-size:12.5px;font-weight:700}b.nm{font-size:16px;font-weight:800}span{font-size:11.5px;font-weight:500;line-height:1.3}
+.bd2{padding:4px 12px 10px;display:flex;flex-direction:column;gap:7px}.row{flex-direction:row!important;gap:12px}.row>div{display:flex;flex-direction:column;gap:1px;flex:1;min-width:0}
+.sgw{position:relative;align-self:flex-end;width:170px;height:62px;margin-top:2px}.sgname{position:absolute;left:0;right:0;bottom:4px;text-align:center;font-size:12px;font-weight:800;color:#1B3A6B;letter-spacing:.5px}.sig2{width:96px;height:36px;left:22px;bottom:16px;opacity:.9}.seal2{width:58px;height:58px;right:-6px;top:-10px;opacity:.78}
+.ft{background:#F2F4F7;color:#3E4B5E;font-size:9.5px;font-weight:600;line-height:1.35;padding:7px 12px;border-top:1px solid #E3E8F0}
 .warn{background:var(--c);color:#fff;border-radius:12px;padding:14px 16px;font-size:13px;line-height:1.45}.warn b{display:block;font-size:11px;letter-spacing:1px;margin-bottom:4px;color:#fff}
 .btns{margin-top:auto;display:flex;gap:8px}.btn{flex:1;height:46px;border-radius:12px;display:flex;align-items:center;justify-content:center;gap:6px;font-size:13px;font-weight:700;text-decoration:none;border:2px solid var(--c);color:var(--c);background:#fff}.btn.p{background:var(--c);color:#fff}
 .meta{font-size:10px;color:#3E4F5A;text-align:center;line-height:1.4}
@@ -956,3 +1049,5 @@ setInterval(refresh,30000);
 document.addEventListener('contextmenu',function(e){e.preventDefault()});
 </script></body></html>`;
 }
+
+function hashSeed(s) { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; } return h; }
