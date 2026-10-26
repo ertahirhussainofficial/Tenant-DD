@@ -40,6 +40,7 @@ async function route(request, env, ctx) {
   if ((x = match(p, "/logo/:token")) && m === "GET") return publicLogo(env, x.token);
   if ((x = match(p, "/vault/:tid/:idx")) && m === "GET") return vaultFile(env, x.tid, x.idx, url);
   if ((x = match(p, "/c/:cardNo")) && m === "GET") return cardLookup(env, x.cardNo);
+  if (p === "/logo.png" && m === "GET") { if (env.DEFAULT_LOGO_URL) return Response.redirect(env.DEFAULT_LOGO_URL, 302); throw err(404, "no default logo"); }
   if (p === "/app/version" && m === "GET") return json({ ok: true, version: Number(env.APP_VERSION || 1), apkUrl: env.APK_URL || "", notes: env.APP_NOTES || "" });
 
   // ---------- Auth ----------
@@ -356,13 +357,21 @@ const CARD_DEFAULTS = {
   title: "IDENTITY CARD",
   issuedBy: "Issued by {landlord} (Landlord) · {address}",
   instructions: "Return this card when vacating · Non-transferable · Validity is checked live by QR — a cancelled card scans NOT VALID",
-  watermark: "{landlord} · VERIFY BY QR"
+  watermark: "{landlord} · VERIFY BY QR",
+  found: "If found, please return to {police}",
+  design: "B"
 };
+function maskedId(type, last4) {
+  if (!last4) return "—"; const t = String(type || "").toLowerCase();
+  if (t.includes("aadh")) return "XXXX XXXX " + last4;
+  if (t.includes("pass")) return "XXXX" + last4;
+  return "XXXXXX" + last4;
+}
 function cardSettings(env, L, P) {
   const c = { ...CARD_DEFAULTS, ...((L && L.card) || {}) };
   const fill = v => String(v || "").replace(/\{landlord\}/g, (L && L.name) || "").replace(/\{address\}/g, (P && P.address) || "").replace(/\{property\}/g, (P && (P.label || P.address)) || "")
     .replace(/\{phone\}/g, (L && L.phone) || "").replace(/\{police\}/g, (P && P.policeStation) || "").replace(/\{site\}/g, String(env.BASE_URL || "").replace(/^https?:\/\//, ""));
-  return { title: fill(c.title), issuedBy: fill(c.issuedBy), instructions: fill(c.instructions), watermark: fill(c.watermark) };
+  return { design: ["A", "B", "C"].includes(c.design) ? c.design : "B", title: fill(c.title), issuedBy: fill(c.issuedBy), instructions: fill(c.instructions), watermark: fill(c.watermark), found: fill(c.found || CARD_DEFAULTS.found).replace(/\s+$/, "") || "If found, please return to the nearest police station" };
 }
 
 async function uploadPropertyLogo(request, env, u, pid) {
@@ -469,7 +478,7 @@ async function patchMe(request, env, u) {
   if (b.tgChatId !== undefined) patch.tgChatId = String(b.tgChatId || "");
   if (b.alerts) patch.alerts = { scan: !!b.alerts.scan, note: !!b.alerts.note };
   if (b.helpline !== undefined) patch.helpline = String(b.helpline || "");
-  if (b.card && typeof b.card === "object") { const c = {}; for (const k of ["title", "issuedBy", "instructions", "watermark"]) if (b.card[k] !== undefined) c[k] = String(b.card[k] || "").slice(0, 220); patch.card = { ...((await fbGet(env, "landlords/" + u.lid + "/card")) || {}), ...c }; }
+  if (b.card && typeof b.card === "object") { const c = {}; for (const k of ["title", "issuedBy", "instructions", "watermark", "found", "design"]) if (b.card[k] !== undefined) c[k] = String(b.card[k] || "").slice(0, 220); patch.card = { ...((await fbGet(env, "landlords/" + u.lid + "/card")) || {}), ...c }; }
   await fbPatch(env, "landlords/" + u.lid, patch);
   return json({ ok: true });
 }
@@ -673,7 +682,7 @@ function publicPayload(env, r, token, scanId) {
     cardNo: T.cardNo, name: T.name, parentage: T.parentage, dob: T.dob,
     roomNo: T.roomNo, roomAddr: P.address, permAddr: T.permAddr,
     policeStation: P.policeStation, landlord: L.name, landlordPhone: L.phone || "", mobile: T.phone || "",
-    idDoc: (T.idDocType || "") + (T.idDocLast4 ? " · XXXX " + T.idDocLast4 : ""),
+    idDocType: T.idDocType || "ID DOCUMENT", idDoc: maskedId(T.idDocType, T.idDocLast4),
     issuedAt: T.issuedAt, validTill: T.validTill, revokedAt: T.revokedAt || null,
     card: cardSettings(env, L, P),
     logoUrl: P.logo ? env.BASE_URL + "/logo/" + token : null,
@@ -957,73 +966,89 @@ function verifyPage(env, d, token) {
     VALIDITY_ENDED: "Validity ended on " + fmtDate(d.validTill),
     CARD_REISSUED: "This card was reported lost / re-issued",
     NOT_ACTIVATED: "Card not yet activated by landlord",
-    FAKE_OR_DAMAGED: "QR code is not genuine or is damaged",
-    UNKNOWN_CARD: "Card not found"
+    FAKE_OR_DAMAGED: "This QR code is not genuine, or it is damaged",
+    UNKNOWN_CARD: "No card found for this code"
   }[d.reason] || (valid ? "Active tenant · verified live just now" : "");
   const c = d.card || {};
   const seed = hashSeed(d.cardNo || "x");
   const rot = (base, spread, i) => (base + ((seed >> (i * 5)) % 100) / 100 * spread).toFixed(1);
 
   const card = d.cardNo ? `
-<div class="card ${valid ? "" : "dim"}">
+<div class="card d${esc(c.design || "B")} ${valid ? "" : "dim"}">
+  <div class="wmk" aria-hidden="true">${Array(7).fill(`<div>${esc(c.watermark || "")} &nbsp;·&nbsp; ${esc(c.watermark || "")} &nbsp;·&nbsp; ${esc(c.watermark || "")}</div>`).join("")}</div>
+  ${(c.design || "B") === "B" ? `<div class="tri"><i></i><i></i><i></i></div>` : ""}
   <div class="hd">
-    ${d.logoUrl ? `<img class="logo" src="${esc(d.logoUrl)}" alt="">` : `<div class="logo ph">ID</div>`}
+    <div class="logo">${d.logoUrl ? `<img src="${esc(d.logoUrl)}" alt="">` : `<img src="/logo.png" alt="" onerror="this.parentNode.innerHTML='<b style=color:#1B3A6B;font-size:14px>ID</b>'">`}</div>
     <div class="hdt"><div class="t1">${esc(c.title || "IDENTITY CARD")}</div><div class="t2">${esc(c.issuedBy || "")}</div></div>
     <div class="room"><div class="rl">ROOM</div><div class="rn">${esc(d.roomNo)}</div></div>
   </div>
+  <div class="gband"></div>
   <div class="bd">
-    <div class="phw">
-      <div class="ph">${d.photoUrl ? `<img src="${esc(d.photoUrl)}" alt="Tenant photo">` : `<span>NO PHOTO</span>`}</div>
-      ${d.sealUrl ? `<img class="stp seal1" style="transform:rotate(${rot(-24, 14, 0)}deg)" src="${esc(d.sealUrl)}" alt="">` : ""}${d.sigUrl ? `<img class="stp sig1" style="transform:rotate(${rot(-14, 10, 1)}deg)" src="${esc(d.sigUrl)}" alt="">` : ""}
+    <div class="lcol">
+      <div class="phw">
+        <div class="ph">${d.photoUrl ? `<img src="${esc(d.photoUrl)}" alt="Tenant photo">` : `<span>PHOTO</span>`}</div>
+        ${d.sigUrl ? `<img class="stp sig1" style="transform:rotate(${rot(-11, 6, 1)}deg)" src="${esc(d.sigUrl)}" alt="">` : ""}
+        ${d.sealUrl ? `<img class="stp seal1" style="transform:rotate(${rot(-22, 10, 0)}deg)" src="${esc(d.sealUrl)}" alt="">` : ""}
+      </div>
+      <div class="cno"><label>CARD NO.</label><b>${esc(d.cardNo)}</b></div>
     </div>
     <div class="f">
       <div><label>NAME</label><b class="nm">${esc(d.name)}</b></div>
-      <div><label>FATHER'S / HUSBAND'S NAME</label><b>${esc(d.parentage)}</b></div>
-      <div><label>DATE OF BIRTH</label><b>${esc(d.dob)}</b></div>
+      <div class="row"><div style="flex:1.4"><label>FATHER / HUSBAND</label><b>${esc(d.parentage)}</b></div><div><label>DATE OF BIRTH</label><b>${esc(d.dob)}</b></div></div>
       <div><label>PERMANENT ADDRESS</label><span>${esc(d.permAddr)}</span></div>
-      <div><label>ID DOCUMENT</label><b>${esc(d.idDoc || "—")}</b></div>
-      <div><label>MOBILE</label><b>${esc(d.mobile || "—")}</b></div>
+      <div class="row"><div><label>${esc((d.idDocType || "ID DOCUMENT").toUpperCase())}</label><b>${esc(d.idDoc || "—")}</b></div><div><label>MOBILE</label><b>${esc(d.mobile || "—")}</b></div></div>
+      <div class="row"><div><label>ISSUED</label><b>${fmtDate(d.issuedAt)}</b></div><div><label>VALID TILL</label><b>${fmtDate(d.validTill)}</b></div></div>
+      <div class="sep"></div>
+      <div><label>${valid ? "ROOM ADDRESS" : "WAS REGISTERED AT"}</label><span>Room ${esc(d.roomNo)}, ${esc(d.roomAddr)}</span></div>
+      <div class="row"><div><label>LANDLORD</label><b>${esc(d.landlord)}</b></div><div><label>LANDLORD MOBILE</label><b>${esc(d.landlordPhone || "—")}</b></div></div>
+      <div><label>POLICE STATION</label><b>${esc(d.policeStation || "—")}</b></div>
     </div>
   </div>
-  <div class="bd2">
-    <div><label>${valid ? "ROOM ADDRESS" : "WAS REGISTERED AT"}</label><span>Room ${esc(d.roomNo)}, ${esc(d.roomAddr)}</span></div>
-    <div class="row"><div><label>LANDLORD</label><b>${esc(d.landlord)}</b></div><div><label>LANDLORD MOBILE</label><b>${esc(d.landlordPhone || "—")}</b></div></div>
-    <div class="row"><div><label>POLICE STATION</label><b>${esc(d.policeStation || "—")}</b></div><div><label>CARD NO.</label><b>${esc(d.cardNo)}</b></div></div>
-    <div class="sgw">
-      <div class="sgname">${esc(d.landlord)}</div>
-      ${d.sigUrl ? `<img class="stp sig2" style="transform:rotate(${rot(-5, 6, 2)}deg)" src="${esc(d.sigUrl)}" alt="Landlord signature">` : ""}
-      ${d.sealUrl ? `<img class="stp seal2" style="transform:rotate(${rot(4, 14, 3)}deg)" src="${esc(d.sealUrl)}" alt="Landlord seal">` : ""}
-    </div>
+  <div class="sgw">
+    ${d.sigUrl ? `<img class="stp sig2" style="transform:rotate(${rot(-6, 5, 2)}deg)" src="${esc(d.sigUrl)}" alt="Landlord signature">` : ""}
+    ${d.sealUrl ? `<img class="stp seal2" style="transform:rotate(${rot(6, 10, 3)}deg)" src="${esc(d.sealUrl)}" alt="Landlord seal">` : ""}
+    <div class="sgname">${esc(d.landlord)}</div>
   </div>
   <div class="ft">${esc(c.instructions || "")}</div>
-  <div class="wmk" aria-hidden="true">${Array(6).fill(`<div>${esc(c.watermark || "")} · ${esc(c.watermark || "")}</div>`).join("")}</div>
-</div>` : `<div class="card dim"><div class="bd2"><b>No card data</b><span>${esc(reasonText)}</span></div></div>`;
+  <div class="fs">${esc(c.found || "")}</div>
+</div>` : `<div class="card dim"><div class="f" style="padding:14px"><b>No card data</b><span>${esc(reasonText)}</span></div></div>`;
 
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"><title>${word} · ${esc(env.APP_NAME)}</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
 <style>
 :root{--c:${col};--bg:${bg}}
 *{box-sizing:border-box}body{margin:0;font-family:Inter,system-ui,sans-serif;background:var(--bg);color:#141413;min-height:100vh;position:relative;overflow-x:hidden;-webkit-user-select:none;user-select:none}
-.wm{position:fixed;inset:-40%;display:flex;flex-direction:column;gap:70px;transform:rotate(-32deg);color:var(--c);opacity:.16;font-size:84px;font-weight:900;letter-spacing:6px;white-space:nowrap;pointer-events:none;z-index:5}
+.wm{position:fixed;inset:-40%;display:flex;flex-direction:column;gap:70px;transform:rotate(-32deg);color:var(--c);opacity:.11;font-weight:900;font-size:84px;letter-spacing:6px;white-space:nowrap;pointer-events:none;z-index:5;mix-blend-mode:multiply}
 .band{position:fixed;left:0;right:0;top:0;height:6px;background:var(--c);animation:pulse 3s infinite;z-index:6}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
 .wrap{position:relative;z-index:1;max-width:430px;margin:0 auto;padding:22px 16px 24px;display:flex;flex-direction:column;gap:12px;min-height:100vh}
 .st{display:flex;align-items:center;gap:12px;color:var(--c)}.st svg{width:40px;height:40px;flex-shrink:0}.st .w{font-size:30px;font-weight:900;letter-spacing:2px;line-height:1}.st .s{font-size:12px;font-weight:600;opacity:.85}
 .card{position:relative;background:#fff;border-radius:16px;overflow:hidden;border:2px solid var(--c);box-shadow:0 8px 24px rgba(0,0,0,.12)}.card.dim{filter:grayscale(.6);opacity:.92}
-.card .wmk{position:absolute;inset:-30%;display:flex;flex-direction:column;gap:38px;transform:rotate(-28deg);color:#1B3A6B;opacity:.07;font-size:22px;font-weight:800;letter-spacing:3px;white-space:nowrap;pointer-events:none;z-index:0}
+.card .wmk{position:absolute;inset:-35%;display:flex;flex-direction:column;gap:34px;transform:rotate(-24deg);color:#1B3A6B;opacity:.07;font-size:20px;font-weight:800;letter-spacing:3px;white-space:nowrap;pointer-events:none;z-index:0}
+.card .wmk div:nth-child(even){padding-left:90px}
 .card>*:not(.wmk){position:relative;z-index:1}
-.hd{background:#1B3A6B;color:#fff;padding:10px 12px;display:flex;align-items:center;gap:10px}.logo{width:40px;height:40px;border-radius:9px;object-fit:cover;background:#fff;flex-shrink:0}.logo.ph{display:flex;align-items:center;justify-content:center;color:#1B3A6B;font-weight:900;font-size:13px}
-.hdt{flex:1;min-width:0}.t1{font-size:13px;font-weight:800;letter-spacing:1.5px}.t2{font-size:9px;opacity:.85;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.room{background:#fff;color:#1B3A6B;border-radius:8px;padding:5px 9px;text-align:center;line-height:1}.rl{font-size:7px;font-weight:700;letter-spacing:1px}.rn{font-size:18px;font-weight:900}
-.bd{display:flex;gap:12px;padding:12px 12px 4px}.phw{position:relative;width:96px;height:116px;flex-shrink:0}.ph{width:96px;height:116px;border-radius:8px;background:#F2F4F7;border:1px solid #D9DEE7;overflow:hidden;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:600;color:#5A6478}.ph img{width:100%;height:100%;object-fit:cover}
-.stp{position:absolute;pointer-events:none;object-fit:contain}.seal1{width:54px;height:54px;left:-16px;bottom:-14px;opacity:.78}.sig1{width:62px;height:26px;left:8px;bottom:10px;opacity:.92}
-.f{display:flex;flex-direction:column;gap:6px;min-width:0;flex:1}.f>div,.bd2>div{display:flex;flex-direction:column;gap:1px}
-label{font-size:8.5px;font-weight:700;color:#5A6478;letter-spacing:1px}b{font-size:12.5px;font-weight:700}b.nm{font-size:16px;font-weight:800}span{font-size:11.5px;font-weight:500;line-height:1.3}
-.bd2{padding:4px 12px 10px;display:flex;flex-direction:column;gap:7px}.row{flex-direction:row!important;gap:12px}.row>div{display:flex;flex-direction:column;gap:1px;flex:1;min-width:0}
-.sgw{position:relative;align-self:flex-end;width:170px;height:62px;margin-top:2px}.sgname{position:absolute;left:0;right:0;bottom:4px;text-align:center;font-size:12px;font-weight:800;color:#1B3A6B;letter-spacing:.5px}.sig2{width:96px;height:36px;left:22px;bottom:16px;opacity:.9}.seal2{width:58px;height:58px;right:-6px;top:-10px;opacity:.78}
-.ft{background:#F2F4F7;color:#3E4B5E;font-size:9.5px;font-weight:600;line-height:1.35;padding:7px 12px;border-top:1px solid #E3E8F0}
+.hd{background:#1B3A6B;color:#fff;padding:10px 12px;display:flex;align-items:center;gap:10px}
+.tri{display:flex;height:6px}.tri i{flex:1}.tri i:nth-child(1){background:#F0862E}.tri i:nth-child(2){background:#fff}.tri i:nth-child(3){background:#159A5B}
+.card.dB .hd,.card.dC .hd{background:#fff;color:#1B3A6B}.card.dC .hd{color:#141413}.card.dB .t2,.card.dC .t2{color:#5A6478;opacity:1}.card.dB .logo,.card.dC .logo{background:#EEF2F8}.card.dC .logo{border:1px solid #D9DEE7}
+.card.dB .room{background:#1B3A6B;color:#fff}.card.dC .room{background:#F2F4F7;color:#1B3A6B;border:1.5px solid #1B3A6B}
+.card.dB .gband,.card.dC .gband{background:#1B3A6B;height:3px}
+.card.dB .fs{background:#159A5B}.card.dC .fs{background:#fff;color:#1B3A6B;border-top:2px solid #1B3A6B}
+.sep{height:1px;background:#E3E8F0;margin:2px 0}.logo{width:44px;height:44px;border-radius:10px;background:#fff;flex-shrink:0;overflow:hidden;display:flex;align-items:center;justify-content:center}.logo img{width:100%;height:100%;object-fit:cover;aspect-ratio:1/1}
+.gband{height:4px;background:#159A5B}
+.hdt{flex:1;min-width:0}.t1{font-size:16px;font-weight:800;letter-spacing:2px}.t2{font-size:10px;opacity:.88;margin-top:2px;line-height:1.25}
+.room{background:#fff;color:#1B3A6B;border-radius:9px;padding:5px 10px;text-align:center;line-height:1}.rl{font-size:7.5px;font-weight:800;letter-spacing:1.5px}.rn{font-size:21px;font-weight:900;margin-top:2px}
+.bd{display:flex;gap:12px;padding:12px 12px 6px}.lcol{display:flex;flex-direction:column;gap:8px;flex-shrink:0;width:104px}.phw{position:relative;width:104px;height:124px}.ph{width:104px;height:124px;border-radius:8px;background:#F2F4F7;border:1px solid #D9DEE7;overflow:hidden;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;color:#5A6478}.ph img{width:100%;height:100%;object-fit:cover}
+.stp{position:absolute;pointer-events:none;object-fit:contain}.sig1{width:74px;height:28px;left:14px;bottom:10px;opacity:.95;z-index:1}.seal1{width:62px;height:62px;left:-22px;bottom:-6px;opacity:.84;z-index:2}
+.cno{display:flex;flex-direction:column;gap:1px;text-align:center}.cno b{font-size:10.5px;letter-spacing:.2px;color:#1B3A6B;white-space:nowrap}
+.f{display:flex;flex-direction:column;gap:7px;min-width:0;flex:1}.f>div{display:flex;flex-direction:column;gap:1px}
+.row{flex-direction:row!important;gap:10px}.row>div{display:flex;flex-direction:column;gap:1px;flex:1;min-width:0}
+label{font-size:8.5px;font-weight:700;color:#5A6478;letter-spacing:1.2px}b{font-size:13.5px;font-weight:700;line-height:1.2}b.nm{font-size:19px;font-weight:800}span{font-size:12.5px;font-weight:600;line-height:1.3}
+.sgw{position:relative;height:84px;margin:0 12px 2px}.sgname{position:absolute;right:16px;bottom:2px;width:170px;text-align:center;font-size:13px;font-weight:800;color:#1B3A6B;letter-spacing:.5px}.sig2{width:120px;height:46px;right:52px;top:6px;opacity:.95;z-index:1}.seal2{width:72px;height:72px;right:-4px;top:-6px;opacity:.84;z-index:2}
+.ft{background:#F2F4F7;color:#3E4B5E;font-size:10px;font-weight:600;line-height:1.35;padding:7px 12px;border-top:1px solid #E3E8F0}
+.fs{background:#1B3A6B;color:#fff;font-size:10.5px;font-weight:700;padding:7px 12px;letter-spacing:.3px}
 .warn{background:var(--c);color:#fff;border-radius:12px;padding:14px 16px;font-size:13px;line-height:1.45}.warn b{display:block;font-size:11px;letter-spacing:1px;margin-bottom:4px;color:#fff}
 .btns{margin-top:auto;display:flex;gap:8px}.btn{flex:1;height:46px;border-radius:12px;display:flex;align-items:center;justify-content:center;gap:6px;font-size:13px;font-weight:700;text-decoration:none;border:2px solid var(--c);color:var(--c);background:#fff}.btn.p{background:var(--c);color:#fff}
 .meta{font-size:10px;color:#3E4F5A;text-align:center;line-height:1.4}
+.note{background:#fff;border:1px solid #D9DEE7;border-radius:12px;padding:12px 14px;font-size:12.5px;line-height:1.45;color:#2B3342}.note b{font-size:12.5px}
 </style></head><body>
 <div class="band"></div>
 <div class="wm" aria-hidden="true">${Array(8).fill(`<div>${word} · ${word} · ${word}</div>`).join("")}</div>
@@ -1033,12 +1058,12 @@ label{font-size:8.5px;font-weight:700;color:#5A6478;letter-spacing:1px}b{font-si
     : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M15 9l-6 6M9 9l6 6"/></svg>`}
     <div><div class="w" id="w">${word}</div><div class="s" id="s">${esc(reasonText)}</div></div></div>
   ${card}
-  ${valid ? "" : `<div class="warn"><b>${pending ? "NOT YET ACTIVE" : "DO NOT ACCEPT THIS CARD"}</b>${esc(reasonText)}.</div>`}
+  ${valid ? `<div class="note">Match the photo with the person in front of you. Tap <b>Refresh</b> to re-check the status; it also refreshes itself every 30 seconds.</div>` : `<div class="warn"><b>${pending ? "NOT YET ACTIVE" : "DO NOT ACCEPT THIS CARD"}</b>${esc(reasonText)}.</div>`}
   <div class="btns">
     <a class="btn" href="javascript:refresh()">↻ Refresh</a>
     <a class="btn p" href="javascript:location.reload()">⌁ Scan again</a>
   </div>
-  <div class="meta">Verified at <span id="clk"></span> · Scan #${esc(d.scanId)} · auto-refreshes every 30 s<br>Match the photo with the person. This scan is logged.</div>
+  <div class="meta">Verified at <span id="clk"></span> · Scan #${esc(d.scanId)}<br>This check has been logged for the landlord.</div>
 </div>
 <script>
 var TOKEN=${JSON.stringify(token)};
